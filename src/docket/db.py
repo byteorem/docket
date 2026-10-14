@@ -138,11 +138,18 @@ def _prune_backups(backups: Path) -> None:
 
 
 def _backup_to(conn: sqlite3.Connection, dest: Path) -> None:
-    out = sqlite3.connect(dest)
+    """Copy to a temp file, then atomically move it onto `dest`."""
+    tmp = dest.with_name(f"{dest.name}.{os.getpid()}.tmp")
+    out = sqlite3.connect(tmp)
     try:
-        conn.backup(out)
-    finally:
-        out.close()
+        try:
+            conn.backup(out)
+        finally:
+            out.close()
+        os.replace(tmp, dest)
+    except BaseException:
+        tmp.unlink(missing_ok=True)
+        raise
 
 
 def _check_fts5(conn: sqlite3.Connection) -> None:
