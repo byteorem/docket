@@ -88,19 +88,26 @@ def install_hook() -> dict:
 
     backup: Path | None = None
     if added:
-        path.parent.mkdir(parents=True, exist_ok=True)
-        if original is not None:
-            backup = path.with_name(path.name + ".bak")
-            shutil.copy2(path, backup)
-        fd, tmp = tempfile.mkstemp(dir=path.parent, prefix=path.name + ".", suffix=".tmp")
+        tmp: Path | None = None
         try:
+            path.parent.mkdir(parents=True, exist_ok=True)
+            if original is not None:
+                backup = path.with_name(path.name + ".bak")
+                shutil.copy2(path, backup)
+            fd, name = tempfile.mkstemp(dir=path.parent, prefix=path.name + ".", suffix=".tmp")
+            tmp = Path(name)
             with os.fdopen(fd, "w", encoding="utf-8", newline="\n") as f:
                 json.dump(settings, f, indent=2, ensure_ascii=False)
                 f.write("\n")
+            if original is not None:
+                shutil.copymode(path, tmp)
             os.replace(tmp, path)
-        except BaseException:
-            Path(tmp).unlink(missing_ok=True)
-            raise
+        except OSError as e:
+            raise DocketError(f"could not write {path}: {e.strerror or e}") from e
+        finally:
+            if tmp is not None:
+                tmp.unlink(missing_ok=True)
+
     return {"path": str(path), "added": added, "backup": str(backup) if backup else None}
 
 

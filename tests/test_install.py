@@ -221,3 +221,17 @@ def test_hook_accepts_utf8_bom(settings):
     assert data["permissions"]["allow"] == RULES
     assert not settings.read_bytes().startswith(b"\xef\xbb\xbf")
     assert settings.with_name("settings.json.bak").read_bytes() == raw
+
+
+def test_hook_write_failure_is_one_line(settings, run, monkeypatch):
+    raw = write_settings(settings, {"model": "opus"})
+
+    def deny(src, dst):
+        raise PermissionError(13, "Permission denied")
+
+    monkeypatch.setattr(install.os, "replace", deny)
+    result = run("install", "hook")
+    assert result.exit_code == 1
+    assert result.stderr.count("\n") == 1 and "could not write" in result.stderr
+    assert settings.read_bytes() == raw
+    assert not list(settings.parent.glob("*.tmp"))
