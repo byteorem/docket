@@ -1,53 +1,51 @@
 ---
 name: docket
-description: Local task tracker CLI. Use when the user mentions Docket or one of its tasks, or when a session index (a `repo` or `no repo` header over doing, ready, and waiting lines) is in context.
+description: Local task tracker CLI. Use when the user mentions Docket or one of its tasks, or when a session summary (a `store <path>` line over ready and blocked task lines) is in context.
 ---
 
 # Docket
 
-Everything goes through the `docket` CLI; never open the database. Add `--json` to any command for one JSON value (stdout stays empty on error). Exit 1 is a command error with a one-line message on stderr; exit 2 is a usage error (bad flags or arguments).
+Each repo keeps its tasks as Markdown files in `.git/docket/tasks/`, shared by every worktree. Change tasks through the `docket` CLI, which enforces the rules below; reading a file directly (`docket path ID`) is fine. Add `--json` to any command for one JSON value (stdout stays empty on error). Exit 1 is a command error with a one-line message on stderr; exit 2 is a usage error.
 
 ## Typical session
 
 ```
-docket next --start                      # claim the oldest ready task
+docket ready                                   # what can be worked on now
+docket set a3f8.1 status in_progress
 docket note a3f8.1 "Endpoint streams; pagination still TODO"
-docket add "Fix CSV quoting" --from a3f8.1 --file plan.md   # work found along the way
-docket complete a3f8.1
+docket create "Fix CSV quoting" --file plan.md --set found_in=a3f8.1
+docket close a3f8.1
 ```
 
 ## Commands
 
 | Command | Behavior |
 |---|---|
-| `next [--start]` | Oldest ready task in scope, with body and parent summary. Prints nothing (`null` with `--json`) when none. `--start` sets it to `doing` atomically, so two agents never claim the same task. |
-| `show ID` | Fields and body. |
-| `ls [--tag T] [--status S] [--archived]` | Tasks in scope with status and ready state. |
-| `search QUERY [--archived]` | Full-text search in scope. |
-| `index [--limit N]` | Session summary (what the SessionStart hook prints). |
-| `add "title" [--parent ID] [--dep ID] [--tag T] [--repo KEY \| --no-repo] [--from ID] [--file PATH]` | Create a task. `--dep`, `--tag`, `--repo` repeat. `--from` records the task you were working on when you found this one. Prints the ID and repos. |
-| `set ID FIELD VALUE` | Fields: `title`, `status`, `blocked_on`, `branch`, `pr`, `issue`. |
-| `set ID tags\|repos\|links [VALUE] [--add V] [--remove V]` | `--add` and `--remove` repeat; a bare comma-separated VALUE replaces the whole list. |
-| `note ID "text"` | Append a timestamped line to the body. This is how an agent adds to a body. |
-| `edit ID` | Opens the body in `$VISUAL` or `$EDITOR` for the user to edit; errors if neither is set. |
-| `dep ID DEP_ID` / `undep ID DEP_ID` | Add or remove a dependency. |
-| `attach ID PATH...` | Copy files into the task's attachments and add them to `links`. |
-| `complete ID` / `cancel ID` / `reopen ID` | Archive as done, archive as canceled, return to open. |
-| `export [--format jsonl\|md] [--out DIR]` | Dump all tasks. `jsonl` goes to stdout, or `DIR/docket.jsonl` with `--out`; `md` requires `--out`. |
-| `where`, `doctor` | Show store and repo key, check store health. |
+| `create "title" [--parent ID] [--dep ID] [--set K=V] [--file PATH]` | Create a task, or a subtask with `--parent`. Body from `--file` or stdin. `--dep` and `--set` repeat. |
+| `show ID` / `path ID` | Print the file plus Parent, Blockers, Blocking, Subtasks / print the file's path. |
+| `ls [--status S] [--where K=V] [--all] [--tree]` | Open tasks; `--all` adds closed. `--where` repeats and matches a string, or a list containing the value. |
+| `ready` / `blocked` | Same filters. Ready: open with every dep closed. Blocked: waiting on an open or missing dep. |
+| `set ID KEY VALUE` / `unset ID KEY` | Set `title`, `status`, or any user field / remove a user field. |
+| `add ID KEY VALUE` / `remove ID KEY VALUE` | Edit a list user field. |
+| `close ID [--status S] [--force]` / `reopen ID [--force]` | Close with the first closed status (or `S`) / return to the default status. |
+| `dep ID DEP_ID` / `undep ID DEP_ID` | ID waits on DEP_ID / stop waiting. |
+| `note ID ["text"]` | Append `**<timestamp>** text` to the body; text from stdin if omitted. This is how an agent adds to a body. |
+| `index [--limit N]` | Session summary: underway tasks, ready tasks, blocked count. |
+| `where`, `check`, `help` | Store location; report broken files, missing deps, cycles; usage. |
+| `install skill [--dir DIR]` / `install hook` | Write this skill to `~/.claude/skills/docket/` / add the SessionStart hook and permission rules to Claude Code settings. |
 
-## Concepts
+## Rules
 
-- **IDs and hierarchy**: top-level is four characters (`a3f8`); children append a number (`a3f8.1`, `a3f8.1.1`). Any unique prefix works; an ambiguous prefix errors and lists the matches. A child needs an open parent.
-- **Scope**: inside a git repo, `ls`, `search`, `index`, and `next` show only that repo's tasks. Outside a repo, only tasks with no repo. `--repo KEY` picks another repo (`owner/repo`, or a bare name that matches one known repo); `--all-repos` removes the filter.
-- **Status**: open tasks are `todo`, `doing`, `review`, or `blocked`. `blocked_on` records what a blocked task waits on: set the status to `blocked` first, and setting any other status clears it. Archived tasks take neither `status` nor `blocked_on`.
-- **Archiving**: `complete` and `cancel` archive a task (outcome `done` or `canceled`) and clear its status. A parent can't be completed or canceled while it has open children, and `cancel` is refused while an open task depends on it; the error lists them. `reopen` returns a task to `doing`, and fails on a child whose parent is archived or when it would create a dependency cycle. Tasks are never deleted; `ls` and `search` hide archived ones unless given `--archived`.
-- **Dependencies and readiness**: a dependency is satisfied only when its target is archived as `done`. A task also waits on every ancestor's dependencies. `dep` and `add --dep` reject cycles; `dep` also rejects archived tasks on either side. A task is ready when it is `todo`, has no unsatisfied dependencies, and has no open children, so `next` returns leaf work.
+- **IDs**: top-level is four characters (`a3f8`); subtasks append a number (`a3f8.1`, `a3f8.1.1`). Any unique prefix works, and an exact ID wins over longer IDs it prefixes.
+- **Status** is any string. Only statuses in `closed_statuses` (default `[closed]`) count as closed; `in_progress`, `review`, and the like are all open. New and reopened tasks get `default_status` (default `open`).
+- **Fields**: `id`, `title`, `status`, `created`, `closed_at`, and `deps` are core. Every other key is yours, and `set` stores it as a string. Docket gives user fields no meaning.
+- **Subtasks**: need an open parent. A task can't close with open subtasks, and a subtask can't reopen under a closed parent, unless you pass `--force`. Open subtasks don't affect the parent's state.
+- **Deps**: `dep` rejects self-dependencies, unknown IDs, and cycles. A dep on a closed task stays in the file but no longer blocks.
 
 ## Gotchas
 
-- `next` without `--start` only reads; the task stays `todo` and another agent can claim it.
-- `add` reads its body from stdin whenever stdin is piped and waits for EOF, so a shell that leaves a pipe open hangs it. Pass the body with `--file PATH`, or redirect stdin from an empty source.
-- Write multi-line bodies to a file for `--file`; quoted arguments mangle them. Literal newlines are kept, and `\n` stays two characters.
-- Subtasks share their root task's attachment folder.
-- A child does not inherit its parent's repos.
+- `ready` includes parents whose subtasks are still open. Check `show` before starting a parent.
+- `set ID status closed` follows the same subtask rules as `close`, but has no `--force`; use `close --force`.
+- `create` and `note` read stdin whenever it is piped and wait for EOF, so a shell that leaves a pipe open hangs them. Pass the body with `--file`, or the note text as an argument.
+- Write multi-line bodies to a file for `--file`. Quoted arguments keep literal newlines, but `\n` stays two characters.
+- Outside a git repo, reads show nothing and writes fail; set `DOCKET_DIR` to use a folder instead.

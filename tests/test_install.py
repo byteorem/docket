@@ -40,7 +40,7 @@ def load(path: Path):
 def test_skill_default_path(user_home, run):
     result = run("install", "skill")
     target = user_home / ".claude" / "skills" / "docket" / "SKILL.md"
-    assert result.exit_code == 0
+    assert result.code == 0
     assert result.stdout.strip() == f"wrote {target}"
     assert target.read_text(encoding="utf-8").startswith("---\nname: docket\n")
 
@@ -71,7 +71,7 @@ def test_skill_overwrites_and_spares_siblings(tmp_path):
 def test_hook_creates_missing_file(settings, run):
     assert not settings.parent.exists()
     result = run("install", "hook")
-    assert result.exit_code == 0
+    assert result.code == 0
     assert load(settings) == {
         "hooks": {"SessionStart": [{"hooks": [HANDLER]}]},
         "permissions": {"allow": RULES},
@@ -155,7 +155,7 @@ def test_hook_fully_installed_changes_nothing(settings, run):
     )
     before = settings.stat().st_mtime_ns
     result = run("install", "hook")
-    assert result.exit_code == 0
+    assert result.code == 0
     assert "already installed; nothing changed" in result.stdout
     assert settings.read_bytes() == raw
     assert settings.stat().st_mtime_ns == before
@@ -174,7 +174,7 @@ def test_hook_json_output(settings, run):
 def test_hook_invalid_json(settings, run):
     raw = write_settings(settings, b'{"hooks": ')
     result = run("install", "hook")
-    assert result.exit_code == 1
+    assert result.code == 1
     assert result.stderr.count("\n") == 1 and "not valid JSON" in result.stderr
     assert settings.read_bytes() == raw
     assert not settings.with_name("settings.json.bak").exists()
@@ -184,7 +184,7 @@ def test_hook_invalid_json(settings, run):
 def test_hook_non_object_top_level(settings, run, value):
     raw = write_settings(settings, json.dumps(value).encode())
     result = run("install", "hook")
-    assert result.exit_code == 1
+    assert result.code == 1
     assert "JSON object" in result.stderr
     assert settings.read_bytes() == raw
 
@@ -201,7 +201,7 @@ def test_hook_non_object_top_level(settings, run, value):
 def test_hook_wrong_nested_types(settings, run, data, key):
     raw = write_settings(settings, data)
     result = run("install", "hook")
-    assert result.exit_code == 1
+    assert result.code == 1
     assert f"'{key}'" in result.stderr and "Traceback" not in result.stderr
     assert settings.read_bytes() == raw
 
@@ -231,7 +231,7 @@ def test_hook_write_failure_is_one_line(settings, run, monkeypatch):
 
     monkeypatch.setattr(install.os, "replace", deny)
     result = run("install", "hook")
-    assert result.exit_code == 1
+    assert result.code == 1
     assert result.stderr.count("\n") == 1 and "could not write" in result.stderr
     assert settings.read_bytes() == raw
     assert not list(settings.parent.glob("*.tmp"))

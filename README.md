@@ -2,7 +2,7 @@
 
 > Local task tracker for you and your coding agents
 
-Tasks live in one SQLite database outside every repo and are scoped to the repo you run `docket` from. They have subtasks, dependencies, and attachments, and `docket next --start` hands each agent the oldest ready task without two agents ever claiming the same one.
+Each repo keeps its tasks in `.git/docket/` as Markdown files with YAML frontmatter, so git never tracks them and every worktree shares them. Docket owns identity, status, dependencies, and subtasks; any other frontmatter field is yours. There is no index or daemon: every command reads the files directly.
 
 ## Install
 
@@ -10,27 +10,28 @@ Tasks live in one SQLite database outside every repo and are scoped to the repo 
 uv tool install .
 ```
 
-Run it from a clone. Requires Python 3.12+ and an SQLite built with FTS5.
+Run it from a clone. Requires Python 3.12+.
 
 ## Usage
 
 ```sh
-docket add "Add CSV export endpoint" --tag api    # new task: v4ek
-docket add "Stream rows" --parent v4ek            # subtask: v4ek.1
-docket next --start                               # claim the oldest ready task
-docket note v4ek.1 "Pagination still TODO"        # append to its body
-docket complete v4ek.1                            # archive it as done
+docket create "Add CSV export endpoint" --set branch=feat/csv   # created v4ek
+docket create "Stream rows" --parent v4ek                       # created v4ek.1
+docket set v4ek.1 status in_progress
+docket note v4ek.1 "Pagination still TODO"
+docket close v4ek.1
 ```
 
 | Commands | |
 |---|---|
-| `add` `show` `ls` `search` `next` | Create, read, and find tasks |
-| `set` `edit` `note` `attach` | Change fields, body, and attachments |
-| `dep` `undep` | Make a task wait on another |
-| `complete` `cancel` `reopen` | Archive and unarchive |
-| `where` `index` `doctor` `export` `install` | Store, session summary, health, export, agent setup |
+| `create` `show` `path` | Create and read tasks |
+| `ls` `ready` `blocked` | List by state, filtered with `--status` and `--where K=V` |
+| `set` `unset` `add` `remove` `note` | Change fields and append to the body |
+| `close` `reopen` `dep` `undep` | Status and dependencies |
+| `where` `index` `check` `help` | Store location, session summary, problems, usage |
+| `install` | Agent setup |
 
-Every command takes `--json`, and `docket <command> --help` lists its flags. The bundled [skill](src/docket/SKILL.md) is the full reference, covering scope, readiness, and archiving rules.
+Every command takes `--json`, and `docket help COMMAND` lists its flags. The bundled [skill](src/docket/SKILL.md) is the full reference, covering IDs, subtask rules, and readiness.
 
 ## Agent setup
 
@@ -41,16 +42,22 @@ docket install hook
 
 `install skill` writes the skill to `~/.claude/skills/docket/SKILL.md`. Pass `--dir` to use another skills folder.
 
-`install hook` adds a Claude Code SessionStart hook that runs `docket index`, so each session starts with the repo's open tasks in context. It also adds permission rules that let agents run `docket` without prompting. It backs up `settings.json` first and changes nothing when already installed.
+`install hook` adds a Claude Code SessionStart hook that runs `docket index`, so each session starts with the repo's open tasks in context. It also adds permission rules that let agents run `docket` without prompting. It backs up `settings.json` first and changes nothing when already installed. `index` always exits 0 and prints nothing in a repo that has never had a task.
 
 ## Store
 
-Everything lives in `~/.docket`, or `$DOCKET_HOME` when set:
-
 ```
-docket.db       the database
-backups/        daily copies, 14 kept
-attachments/    files copied in by attach, one folder per top-level task
+<repo>/.git/docket/
+├── config.yaml     optional
+├── .lock           held during a write
+└── tasks/<id>.md
 ```
 
-Inside a git repo, the repo key is `owner/repo` from the `origin` URL, or the folder name when there is no `origin`. `docket where` shows the key and the remote it came from.
+Docket finds the store from the current folder, following a linked worktree's `.git` file to the main repo's git directory. `DOCKET_DIR` points it at any folder instead. Deleting or recloning the repo deletes its tasks.
+
+`config.yaml` in the store overrides `~/.docket/config.yaml` (or `$DOCKET_HOME/config.yaml`):
+
+```yaml
+default_status: open         # set by create and reopen
+closed_statuses: [closed]    # close sets the first; any other status is open
+```

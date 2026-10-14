@@ -1,1 +1,1 @@
-"""Docket: personal local task tracker."""
+"""Docket: local, file-based task tracker."""

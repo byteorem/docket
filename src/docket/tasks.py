@@ -1,625 +1,623 @@
-"""Task logic: lifecycle, relationships, cycle rule, readiness, search. Returns plain data."""
+"""Task files: frontmatter read and write, IDs, field rules, and the commands built on them."""
 
 from __future__ import annotations
 
-import json
-import os
+import re
 import secrets
-import shlex
-import shutil
-import sqlite3
 import string
-import subprocess
-import sys
-import tempfile
-from collections.abc import Iterable, Sequence
+from collections import defaultdict
+from collections.abc import Iterable, Iterator
+from contextlib import contextmanager
+from dataclasses import dataclass, field
+from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
 
-from docket import db
-from docket import repo as repo_mod
-from docket.db import DocketError
-from docket.repo import Scope
+import yaml
 
-STATUSES = ("todo", "doing", "review", "blocked")
-SCALAR_FIELDS = ("title", "status", "blocked_on", "branch", "pr", "issue")
-# Scalar fields that make no sense on an archived task.
-OPEN_ONLY_FIELDS = ("status", "blocked_on")
-LIST_FIELDS = {
-    "tags": ("task_tags", "tag"),
-    "repos": ("task_repos", "repo"),
-    "links": ("task_links", "link"),
-}
-
-_ID_ALPHABET = string.ascii_lowercase + string.digits
-
-_SELECT = """
-SELECT t.id, t.parent_id, t.title, t.body, t.status, t.blocked_on, t.discovered_from,
-       t.branch, t.pr, t.issue, t.created, t.outcome, t.archived,
-       (SELECT json_group_array(repo) FROM task_repos WHERE task_id = t.id) AS repos,
-       (SELECT json_group_array(tag) FROM task_tags WHERE task_id = t.id) AS tags,
-       (SELECT json_group_array(link) FROM task_links WHERE task_id = t.id) AS links,
-       (SELECT json_group_array(dep_id) FROM deps WHERE task_id = t.id) AS depends_on,
-       {ready} AS ready
-"""
-
-
-def _entry(row: sqlite3.Row, with_ready: bool) -> dict[str, Any]:
-    task: dict[str, Any] = {
-        "id": row["id"],
-        "parent": row["parent_id"],
-        "title": row["title"],
-        "body": row["body"],
-        "status": row["status"],
-        "blocked_on": row["blocked_on"],
-        "repos": sorted(json.loads(row["repos"])),
-        "depends_on": sorted(json.loads(row["depends_on"])),
-        "discovered_from": row["discovered_from"],
-        "tags": sorted(json.loads(row["tags"])),
-        "branch": row["branch"],
-        "pr": row["pr"],
-        "issue": row["issue"],
-        "links": sorted(json.loads(row["links"])),
-        "created": row["created"],
-        "outcome": row["outcome"],
-        "archived": row["archived"],
-    }
-    if with_ready:
-        task["ready"] = bool(row["ready"])
-    return task
-
-
-def _select(
-    conn: sqlite3.Connection,
-    where: str = "1",
-    params: Sequence[Any] = (),
-    *,
-    frm: str = "tasks t",
-    order: str = "t.created, t.id",
-    with_ready: bool = False,
-) -> list[dict[str, Any]]:
-    ready = "t.id IN (SELECT id FROM ready)" if with_ready else "0"
-    sql = f"{_SELECT.format(ready=ready)} FROM {frm} WHERE {where} ORDER BY {order}"
-    return [_entry(r, with_ready) for r in conn.execute(sql, list(params))]
-
-
-def get(conn: sqlite3.Connection, task_id: str) -> dict[str, Any]:
-    """The task with this exact ID."""
-    rows = _select(conn, "t.id = ?", [task_id])
-    if not rows:
-        raise DocketError(f"no task '{task_id}'")
-    return rows[0]
-
-
-def get_all(conn: sqlite3.Connection) -> list[dict[str, Any]]:
-    """Every task, sorted by created then id."""
-    return _select(conn)
-
-
-def resolve_id(conn: sqlite3.Connection, ref: str) -> str:
-    """Exact ID, else unique prefix. Global: not filtered by scope."""
-    ref = ref.strip().lower()
-    if not ref:
-        raise DocketError("empty task ID")
-    if conn.execute("SELECT 1 FROM tasks WHERE id = ?", (ref,)).fetchone():
-        return ref
-    rows = conn.execute(
-        "SELECT id FROM tasks WHERE substr(id, 1, ?) = ? ORDER BY id", (len(ref), ref)
-    ).fetchall()
-    if not rows:
-        raise DocketError(f"no task matches '{ref}'")
-    if len(rows) > 1:
-        raise DocketError(f"'{ref}' is ambiguous: {', '.join(r[0] for r in rows)}")
-    return rows[0][0]
-
-
-def _require_open(conn: sqlite3.Connection, task_id: str, what: str) -> None:
-    row = conn.execute("SELECT archived FROM tasks WHERE id = ?", (task_id,)).fetchone()
-    if row["archived"] is not None:
-        raise DocketError(f"{task_id} is archived; {what}")
-
-
-def _scope_sql(scope: Scope) -> tuple[str, list[str]]:
-    """Tasks in the scope's repo; with no repo key, tasks that have no repos."""
-    if scope.all_repos:
-        return "1", []
-    if scope.key is None:
-        return "NOT EXISTS (SELECT 1 FROM task_repos r WHERE r.task_id = t.id)", []
-    return "EXISTS (SELECT 1 FROM task_repos r WHERE r.task_id = t.id AND r.repo = ?)", [scope.key]
-
-
-# --- cycle rule ---
-
-_REACH_SQL = """
-WITH RECURSIVE
-lineage(task_id, anc) AS (
-  SELECT id, parent_id FROM tasks WHERE parent_id IS NOT NULL AND archived IS NULL
-  UNION
-  SELECT l.task_id, t.parent_id FROM lineage l JOIN tasks t ON t.id = l.anc
-  WHERE t.parent_id IS NOT NULL
-),
-edges(src, dst) AS (
-  SELECT d.task_id, d.dep_id FROM deps d
-    JOIN tasks a ON a.id = d.task_id JOIN tasks b ON b.id = d.dep_id
-    WHERE a.archived IS NULL AND b.archived IS NULL
-  UNION
-  SELECT l.task_id, d.dep_id FROM lineage l
-    JOIN deps d ON d.task_id = l.anc JOIN tasks b ON b.id = d.dep_id
-    WHERE b.archived IS NULL
-  UNION
-  SELECT parent_id, id FROM tasks WHERE parent_id IS NOT NULL AND archived IS NULL
-),
-reach(node) AS (
-  SELECT dst FROM edges WHERE src = ?
-  UNION
-  SELECT e.dst FROM edges e JOIN reach r ON e.src = r.node
+from docket.graph import Graph, id_key, parent_id
+from docket.store import (
+    NO_STORE,
+    Config,
+    DocketError,
+    Location,
+    atomic_write,
+    discover,
+    load_config,
+    lock,
 )
-SELECT node FROM reach
-"""
+
+CORE = ("id", "title", "status", "created", "closed_at", "deps")
+REQUIRED = ("id", "title", "status", "created")
+COMPUTED = ("path", "state", "parent", "body", "blockers", "blocking", "subtasks", "open_subtasks")
+ID_RE = re.compile(r"[a-z0-9]{4}(\.[1-9][0-9]*)*")
+KEY_RE = re.compile(r"[A-Za-z0-9_][A-Za-z0-9_.-]*")
+ID_CHARS = string.ascii_lowercase + string.digits
+BOM = b"\xef\xbb\xbf"
 
 
-def _reachable(conn: sqlite3.Connection, start: str) -> set[str]:
-    """Open tasks reachable from `start` in one or more steps, over the open-task graph."""
-    return {r[0] for r in conn.execute(_REACH_SQL, (start,))}
+def now() -> str:
+    return datetime.now(UTC).strftime("%Y-%m-%dT%H:%M:%SZ")
 
 
-def _check_dep_cycle(conn: sqlite3.Connection, task_id: str, dep_id: str) -> None:
-    descendants = conn.execute(
-        "SELECT id FROM tasks WHERE substr(id, 1, ?) = ?", (len(task_id) + 1, task_id + ".")
-    ).fetchall()
-    targets = {task_id, *(r[0] for r in descendants)}
-    if ({dep_id} | _reachable(conn, dep_id)) & targets:
-        raise DocketError(f"dependency {task_id} -> {dep_id} would create a cycle")
+# --- frontmatter ---
+
+_TIMESTAMP = "tag:yaml.org,2002:timestamp"
 
 
-def _check_reopen_cycle(conn: sqlite3.Connection, task_id: str) -> None:
-    if task_id in _reachable(conn, task_id):
-        raise DocketError(f"reopening {task_id} would create a dependency cycle")
+def _without_timestamps(resolvers: dict[Any, list[Any]]) -> dict[Any, list[Any]]:
+    return {k: [(tag, rx) for tag, rx in v if tag != _TIMESTAMP] for k, v in resolvers.items()}
 
 
-# --- writes ---
+class _Loader(getattr(yaml, "CSafeLoader", yaml.SafeLoader)):  # type: ignore[misc]
+    """Safe loader that keeps timestamps as the strings they were written as."""
 
 
-def _add_dep(conn: sqlite3.Connection, task_id: str, dep_ref: str) -> None:
-    dep_id = resolve_id(conn, dep_ref)
-    _require_open(conn, dep_id, "it cannot be a dependency")
-    conn.execute("INSERT OR IGNORE INTO deps(task_id, dep_id) VALUES (?, ?)", (task_id, dep_id))
-    _check_dep_cycle(conn, task_id, dep_id)
+_Loader.yaml_implicit_resolvers = _without_timestamps(yaml.SafeLoader.yaml_implicit_resolvers)
 
 
-def _new_top_id(conn: sqlite3.Connection) -> str:
-    while True:
-        candidate = "".join(secrets.choice(_ID_ALPHABET) for _ in range(4))
-        if not conn.execute("SELECT 1 FROM tasks WHERE id = ?", (candidate,)).fetchone():
-            return candidate
+class _Quoted(str):
+    """Dumped double-quoted, so YAML never reads an ID such as 1234 as a number."""
 
 
-def _new_child_id(conn: sqlite3.Connection, parent_id: str) -> str:
-    numbers = [
-        int(r[0].rsplit(".", 1)[1])
-        for r in conn.execute("SELECT id FROM tasks WHERE parent_id = ?", (parent_id,))
-    ]
-    return f"{parent_id}.{max(numbers, default=0) + 1}"
+class _Dumper(yaml.SafeDumper):
+    pass
 
 
-def _unique(values: Iterable[str]) -> list[str]:
-    return list(dict.fromkeys(v.strip() for v in values if v.strip()))
+_Dumper.yaml_implicit_resolvers = _without_timestamps(yaml.SafeDumper.yaml_implicit_resolvers)
+_Dumper.add_representer(
+    _Quoted, lambda d, s: d.represent_scalar("tag:yaml.org,2002:str", str(s), style='"')
+)
+_Dumper.add_representer(
+    list, lambda d, v: d.represent_sequence("tag:yaml.org,2002:seq", v, flow_style=True)
+)
 
 
-def add(
-    conn: sqlite3.Connection,
+class InvalidTask(Exception):
+    def __init__(self, message: str, kind: str = "invalid") -> None:
+        super().__init__(message)
+        self.kind = kind
+
+
+def _frontmatter(lines: Iterator[bytes]) -> dict[str, Any]:
+    """Consume LINES through the closing fence and return the parsed frontmatter."""
+    first = next(lines, b"")
+    if first.removeprefix(BOM).rstrip(b"\r\n") != b"---":
+        raise InvalidTask("file does not start with ---")
+    block = []
+    for line in lines:
+        if line.rstrip(b"\r\n") == b"---":
+            break
+        block.append(line)
+    else:
+        raise InvalidTask("frontmatter has no closing ---")
+    try:
+        meta = yaml.load(b"".join(block).decode("utf-8"), Loader=_Loader)
+    except (UnicodeDecodeError, yaml.YAMLError) as e:
+        raise InvalidTask(f"invalid frontmatter: {' '.join(str(e).split())}") from None
+    if not isinstance(meta, dict):
+        raise InvalidTask("frontmatter is not a mapping")
+    return meta
+
+
+def read_meta(path: Path) -> dict[str, Any]:
+    """Parse the frontmatter only, stopping at the closing fence."""
+    with path.open("rb") as f:
+        return _frontmatter(iter(f))
+
+
+def read_file(path: Path) -> tuple[dict[str, Any], bytes]:
+    """Frontmatter and the body's exact bytes."""
+    return split(path.read_bytes())
+
+
+def split(raw: bytes) -> tuple[dict[str, Any], bytes]:
+    lines = iter(raw.splitlines(keepends=True))
+    meta = _frontmatter(lines)
+    return meta, b"".join(lines)
+
+
+def validate(meta: dict[str, Any], stem: str) -> None:
+    for key in REQUIRED:
+        if key not in meta:
+            raise InvalidTask(f"missing {key}")
+    task_id = meta["id"]
+    if not isinstance(task_id, str) or not ID_RE.fullmatch(task_id):
+        raise InvalidTask(f"id {task_id!r} is not a quoted task ID")
+    if task_id != stem:
+        raise InvalidTask(f"id '{task_id}' does not match filename '{stem}.md'", "id-mismatch")
+    for key in ("title", "status"):
+        if not _is_line(meta[key]):
+            raise InvalidTask(f"{key} must be a one-line string")
+    for key in ("created", "closed_at"):
+        if key in meta and not isinstance(meta[key], str):
+            raise InvalidTask(f"{key} must be a timestamp string")
+    deps = meta.get("deps", [])
+    if not isinstance(deps, list) or not all(isinstance(d, str) for d in deps):
+        raise InvalidTask("deps must be a list of quoted task IDs")
+
+
+def dump(meta: dict[str, Any]) -> bytes:
+    """Frontmatter with fences: core fields in table order, then user fields as they were."""
+    ordered = {k: meta[k] for k in CORE if not _is_empty(meta.get(k))}
+    ordered |= {k: v for k, v in meta.items() if k not in CORE and not _is_empty(v)}
+    ordered["id"] = _Quoted(ordered["id"])
+    if "deps" in ordered:
+        ordered["deps"] = [_Quoted(d) for d in ordered["deps"]]
+    text = yaml.dump(
+        ordered,
+        Dumper=_Dumper,
+        sort_keys=False,
+        allow_unicode=True,
+        default_flow_style=False,
+        width=2**31,
+    )
+    return b"---\n" + text.encode("utf-8") + b"---\n"
+
+
+def _is_empty(value: object) -> bool:
+    return value is None or value == "" or value == [] or value == {}
+
+
+def _is_line(value: object) -> bool:
+    return isinstance(value, str) and bool(value.strip()) and value.splitlines() == [value]
+
+
+# --- the store as read ---
+
+
+@dataclass
+class Task:
+    path: Path
+    meta: dict[str, Any]
+
+    @property
+    def id(self) -> str:
+        return self.meta["id"]
+
+    @property
+    def title(self) -> str:
+        return self.meta["title"]
+
+    @property
+    def status(self) -> str:
+        return self.meta["status"]
+
+    @property
+    def deps(self) -> list[str]:
+        return self.meta.get("deps", [])
+
+    @property
+    def parent(self) -> str | None:
+        return parent_id(self.id)
+
+
+@dataclass
+class Snapshot:
+    location: Location
+    config: Config
+    graph: Graph
+    # Every task file by filename stem, valid or not, so IDs stay unique and resolvable.
+    paths: dict[str, Path]
+    invalid: dict[str, InvalidTask] = field(default_factory=dict)
+
+    @property
+    def folder(self) -> Path:
+        return self.location.require() / "tasks"
+
+    def resolve(self, ref: str) -> str:
+        if self.location.store is None:
+            raise DocketError(f"no task '{ref}': {NO_STORE}")
+        return _match(ref, self.paths, f"no task '{ref}'")
+
+    def get(self, ref: str) -> Task:
+        task_id = self.resolve(ref)
+        if task_id in self.invalid:
+            raise DocketError(
+                f"{self.paths[task_id]}: {self.invalid[task_id]}; fix it by hand (see docket check)"
+            )
+        return self.graph.tasks[task_id]
+
+    def is_closed(self, task: Task) -> bool:
+        return task.status in self.config.closed_statuses
+
+    def object(self, task: Task, **extra: Any) -> dict[str, Any]:
+        """The JSON task object: frontmatter as written, plus path, state, and parent."""
+        return {
+            **{k: v for k, v in task.meta.items() if not _is_empty(v)},
+            "deps": task.deps,
+            "path": str(task.path),
+            "state": self.graph.state(task),
+            "parent": task.parent,
+            **extra,
+        }
+
+
+def _match(ref: str, ids: Iterable[str], missing: str) -> str:
+    """Exact ID, else the one ID starting with REF."""
+    ids = list(ids)
+    if ref in ids:
+        return ref
+    found = sorted((i for i in ids if i.startswith(ref)), key=id_key)
+    if not found:
+        raise DocketError(missing)
+    if len(found) > 1:
+        raise DocketError(f"ambiguous ID '{ref}': {', '.join(found)}")
+    return found[0]
+
+
+def snapshot(location: Location | None = None) -> Snapshot:
+    location = location or discover()
+    config = load_config(location.store)
+    loaded: list[Task] = []
+    paths: dict[str, Path] = {}
+    invalid: dict[str, InvalidTask] = {}
+    folder = location.store / "tasks" if location.store else None
+    if folder is not None and folder.is_dir():
+        for path in folder.glob("*.md"):
+            paths[path.stem] = path
+            try:
+                meta = read_meta(path)
+                validate(meta, path.stem)
+            except InvalidTask as e:
+                invalid[path.stem] = e
+            else:
+                loaded.append(Task(path, meta))
+    graph = Graph(loaded, config.closed_statuses)
+    return Snapshot(location, config, graph, paths, invalid)
+
+
+@contextmanager
+def writing() -> Iterator[Snapshot]:
+    """A snapshot taken and used under the store lock."""
+    location = discover()
+    with lock(location.require()):
+        yield snapshot(location)
+
+
+def _save(task: Task) -> None:
+    _, body = read_file(task.path)
+    atomic_write(task.path, dump(task.meta) + body)
+
+
+# --- field rules ---
+
+
+def _check_line(key: str, value: str) -> None:
+    if not _is_line(value):
+        raise DocketError(f"{key} must be one non-empty line")
+
+
+def _check_user_key(key: str) -> None:
+    if key == "deps":
+        raise DocketError("deps is changed with docket dep and docket undep")
+    if key in ("title", "status"):
+        raise DocketError(f"{key} is required; change it with docket set")
+    if key in CORE:
+        raise DocketError(f"{key} is set by docket")
+    if key in COMPUTED:
+        raise DocketError(f"'{key}' is reserved for computed output")
+    if not KEY_RE.fullmatch(key):
+        raise DocketError(f"invalid field name '{key}'")
+
+
+def _set_status(s: Snapshot, task: Task, status: str, force: bool) -> None:
+    """Change status, enforcing the subtask rules on entering or leaving a closed status."""
+    _check_line("status", status)
+    was_closed = s.is_closed(task)
+    closing = status in s.config.closed_statuses
+    if closing and not was_closed:
+        open_subtasks = s.graph.open_descendants(task.id)
+        if open_subtasks and not force:
+            raise DocketError(
+                f"{task.id} has open subtasks: {', '.join(open_subtasks)}; close them first "
+                f"or use docket close --force"
+            )
+        task.meta["closed_at"] = now()
+    elif was_closed and not closing:
+        parent = s.graph.tasks.get(task.parent) if task.parent else None
+        if parent is not None and s.is_closed(parent) and not force:
+            raise DocketError(
+                f"parent {parent.id} is closed; reopen it first or use docket reopen --force"
+            )
+        task.meta.pop("closed_at", None)
+    task.meta["status"] = status
+
+
+# --- write commands ---
+
+
+def create(
     title: str,
     *,
-    body: str = "",
     parent: str | None = None,
-    deps: Sequence[str] = (),
-    tags: Sequence[str] = (),
-    repos: Sequence[str] = (),
-    discovered_from: str | None = None,
+    deps: Iterable[str] = (),
+    fields: Iterable[tuple[str, str]] = (),
+    body: str = "",
 ) -> dict[str, Any]:
-    """Create a task. `repos` are final repo keys."""
-    title = title.strip()
-    if not title:
-        raise DocketError("title is empty")
-    with db.write(conn):
-        parent_id = None
-        if parent:
-            parent_id = resolve_id(conn, parent)
-            _require_open(conn, parent_id, "a subtask needs an open parent")
-        origin = resolve_id(conn, discovered_from) if discovered_from else None
-        task_id = _new_child_id(conn, parent_id) if parent_id else _new_top_id(conn)
-        conn.execute(
-            "INSERT INTO tasks(id, parent_id, title, body, status, discovered_from, created) "
-            "VALUES (?, ?, ?, ?, 'todo', ?, ?)",
-            (task_id, parent_id, title, body, origin, db.now()),
-        )
-        for table, column, values in (
-            ("task_repos", "repo", repos),
-            ("task_tags", "tag", tags),
-        ):
-            conn.executemany(
-                f"INSERT INTO {table}(task_id, {column}) VALUES (?, ?)",
-                [(task_id, v) for v in _unique(values)],
-            )
-        for dep_ref in deps:
-            _add_dep(conn, task_id, dep_ref)
-        return get(conn, task_id)
-
-
-def dep(conn: sqlite3.Connection, ref: str, dep_ref: str) -> dict[str, Any]:
-    with db.write(conn):
-        task_id = resolve_id(conn, ref)
-        _require_open(conn, task_id, "it cannot take dependencies")
-        _add_dep(conn, task_id, dep_ref)
-        return get(conn, task_id)
-
-
-def undep(conn: sqlite3.Connection, ref: str, dep_ref: str) -> dict[str, Any]:
-    with db.write(conn):
-        task_id = resolve_id(conn, ref)
-        dep_id = resolve_id(conn, dep_ref)
-        cur = conn.execute("DELETE FROM deps WHERE task_id = ? AND dep_id = ?", (task_id, dep_id))
-        if cur.rowcount == 0:
-            raise DocketError(f"{task_id} does not depend on {dep_id}")
-        return get(conn, task_id)
-
-
-def _split_values(value: str) -> list[str]:
-    return _unique(value.split(","))
-
-
-def _set_list(
-    conn: sqlite3.Connection,
-    task_id: str,
-    field: str,
-    value: str | None,
-    add_values: Sequence[str],
-    remove_values: Sequence[str],
-) -> None:
-    table, column = LIST_FIELDS[field]
-
-    def norm(values: Iterable[str]) -> list[str]:
-        vals = _unique(values)
-        return [repo_mod.resolve_key(conn, v) for v in vals] if field == "repos" else vals
-
-    current = {
-        r[0] for r in conn.execute(f"SELECT {column} FROM {table} WHERE task_id = ?", (task_id,))
-    }
-    new = set(current) if value is None else set(norm(_split_values(value)))
-    new |= set(norm(add_values))
-    new -= set(norm(remove_values))
-    conn.executemany(
-        f"DELETE FROM {table} WHERE task_id = ? AND {column} = ?",
-        [(task_id, v) for v in current - new],
-    )
-    conn.executemany(
-        f"INSERT INTO {table}(task_id, {column}) VALUES (?, ?)",
-        [(task_id, v) for v in new - current],
-    )
-
-
-def _set_scalar(conn: sqlite3.Connection, task: dict[str, Any], field: str, value: str) -> None:
-    task_id = task["id"]
-    if field in OPEN_ONLY_FIELDS and task["archived"] is not None:
-        raise DocketError(f"{task_id} is archived; cannot set {field}")
-    if field == "title":
-        if not value.strip():
-            raise DocketError("title is empty")
-        conn.execute("UPDATE tasks SET title = ? WHERE id = ?", (value.strip(), task_id))
-    elif field == "status":
-        if value not in STATUSES:
-            raise DocketError(f"invalid status '{value}'; use {', '.join(STATUSES)}")
-        conn.execute("UPDATE tasks SET status = ? WHERE id = ?", (value, task_id))
-        if value != "blocked":
-            conn.execute("UPDATE tasks SET blocked_on = NULL WHERE id = ?", (task_id,))
-    elif field == "blocked_on":
-        if task["status"] != "blocked":
-            raise DocketError(f"{task_id} is not blocked; set status blocked first")
-        conn.execute("UPDATE tasks SET blocked_on = ? WHERE id = ?", (value or None, task_id))
-    else:
-        conn.execute(f"UPDATE tasks SET {field} = ? WHERE id = ?", (value or None, task_id))
-
-
-def set_field(
-    conn: sqlite3.Connection,
-    ref: str,
-    field: str,
-    value: str | None = None,
-    add_values: Sequence[str] = (),
-    remove_values: Sequence[str] = (),
-) -> dict[str, Any]:
-    """Scalar fields need `value`; list fields take `value` (replace) and/or add/remove."""
-    with db.write(conn):
-        task = get(conn, resolve_id(conn, ref))
-        if field in LIST_FIELDS:
-            _set_list(conn, task["id"], field, value, add_values, remove_values)
-        elif field in SCALAR_FIELDS:
-            if value is None or add_values or remove_values:
-                raise DocketError(f"{field} takes a single value")
-            _set_scalar(conn, task, field, value)
+    _check_line("title", title)
+    fields = list(fields)
+    for key, _ in fields:
+        _check_user_key(key)
+    with writing() as s:
+        if parent is not None:
+            parent_task = s.get(parent)
+            if s.is_closed(parent_task):
+                raise DocketError(f"parent {parent_task.id} is closed; reopen it first")
+            task_id = _child_id(s, parent_task.id)
         else:
-            raise DocketError(f"unknown field '{field}'")
-        return get(conn, task["id"])
+            task_id = _new_id(s)
+        dep_ids = list(dict.fromkeys(s.get(d).id for d in deps))
+        meta = {
+            "id": task_id,
+            "title": title,
+            "status": s.config.default_status,
+            "created": now(),
+            "deps": dep_ids,
+            **dict(fields),
+        }
+        path = s.folder / f"{task_id}.md"
+        text = body.strip("\n")
+        atomic_write(path, dump(meta) + (f"\n{text}\n".encode() if text.strip() else b""))
+        task = Task(path, meta)
+        s.graph = Graph([*s.graph.tasks.values(), task], s.config.closed_statuses)
+        return s.object(task)
 
 
-def note(conn: sqlite3.Connection, ref: str, text: str) -> dict[str, Any]:
-    with db.write(conn):
-        task = get(conn, resolve_id(conn, ref))
-        body = task["body"]
-        if body and not body.endswith("\n"):
-            body += "\n"
-        body += f"- {db.now()} {text}"
-        conn.execute("UPDATE tasks SET body = ? WHERE id = ?", (body, task["id"]))
-        return get(conn, task["id"])
+def _new_id(s: Snapshot) -> str:
+    while True:
+        task_id = "".join(secrets.choice(ID_CHARS) for _ in range(4))
+        if task_id not in s.paths:
+            return task_id
 
 
-def _archive(conn: sqlite3.Connection, ref: str, outcome: str) -> dict[str, Any]:
-    with db.write(conn):
-        task_id = resolve_id(conn, ref)
-        _require_open(conn, task_id, f"it cannot be {outcome}")
-        children = [
-            r[0]
-            for r in conn.execute(
-                "SELECT id FROM tasks WHERE parent_id = ? AND archived IS NULL ORDER BY id",
-                (task_id,),
-            )
-        ]
-        if children:
-            raise DocketError(f"{task_id} has open subtasks: {', '.join(children)}")
-        if outcome == "canceled":
-            dependents = [
-                r[0]
-                for r in conn.execute(
-                    "SELECT d.task_id FROM deps d JOIN tasks x ON x.id = d.task_id "
-                    "WHERE d.dep_id = ? AND x.archived IS NULL ORDER BY d.task_id",
-                    (task_id,),
-                )
-            ]
-            if dependents:
-                raise DocketError(
-                    f"{task_id} cannot be canceled; open tasks depend on it: "
-                    f"{', '.join(dependents)}"
-                )
-        conn.execute(
-            "UPDATE tasks SET status = NULL, blocked_on = NULL, outcome = ?, archived = ? "
-            "WHERE id = ?",
-            (outcome, db.now(), task_id),
-        )
-        return get(conn, task_id)
+def _child_id(s: Snapshot, parent: str) -> str:
+    numbers = [
+        int(i.rpartition(".")[2]) for i in s.paths if ID_RE.fullmatch(i) and parent_id(i) == parent
+    ]
+    return f"{parent}.{max(numbers, default=0) + 1}"
 
 
-def complete(conn: sqlite3.Connection, ref: str) -> dict[str, Any]:
-    return _archive(conn, ref, "done")
+def set_field(ref: str, key: str, value: str) -> dict[str, Any]:
+    with writing() as s:
+        task = s.get(ref)
+        if key == "title":
+            _check_line("title", value)
+            task.meta["title"] = value
+        elif key == "status":
+            _set_status(s, task, value, force=False)
+        else:
+            _check_user_key(key)
+            task.meta[key] = value
+        _save(task)
+        return s.object(task)
 
 
-def cancel(conn: sqlite3.Connection, ref: str) -> dict[str, Any]:
-    return _archive(conn, ref, "canceled")
+def unset_field(ref: str, key: str) -> dict[str, Any]:
+    _check_user_key(key)
+    with writing() as s:
+        task = s.get(ref)
+        if key not in task.meta:
+            raise DocketError(f"{task.id} has no field '{key}'")
+        del task.meta[key]
+        _save(task)
+        return s.object(task)
 
 
-def reopen(conn: sqlite3.Connection, ref: str) -> dict[str, Any]:
-    with db.write(conn):
-        task = get(conn, resolve_id(conn, ref))
-        task_id = task["id"]
-        if task["archived"] is None:
-            raise DocketError(f"{task_id} is not archived")
-        if task["parent"]:
-            parent = get(conn, task["parent"])
-            if parent["archived"] is not None:
-                raise DocketError(f"cannot reopen {task_id}: parent {parent['id']} is archived")
-        conn.execute(
-            "UPDATE tasks SET status = 'doing', outcome = NULL, archived = NULL WHERE id = ?",
-            (task_id,),
-        )
-        _check_reopen_cycle(conn, task_id)
-        return get(conn, task_id)
+def add_value(ref: str, key: str, value: str) -> dict[str, Any]:
+    _check_user_key(key)
+    with writing() as s:
+        task = s.get(ref)
+        current = task.meta.get(key, [])
+        if not isinstance(current, list):
+            raise DocketError(f"{key} is not a list; unset it first")
+        if value in current:
+            raise DocketError(f"{key} already contains '{value}'")
+        task.meta[key] = [*current, value]
+        _save(task)
+        return s.object(task)
 
 
-# --- body: edit, attach ---
+def remove_value(ref: str, key: str, value: str) -> dict[str, Any]:
+    _check_user_key(key)
+    with writing() as s:
+        task = s.get(ref)
+        current = task.meta.get(key)
+        if not isinstance(current, list):
+            raise DocketError(f"{task.id} has no list field '{key}'")
+        if value not in current:
+            raise DocketError(f"{key} does not contain '{value}'")
+        task.meta[key] = [v for v in current if v != value]
+        _save(task)
+        return s.object(task)
 
 
-def _editor_argv(value: str) -> list[str]:
-    whole = shutil.which(value)
-    if whole:
-        return [whole]
-    tokens = shlex.split(value, posix=os.name != "nt")
-    tokens = [t[1:-1] if len(t) >= 2 and t[0] == t[-1] and t[0] in "\"'" else t for t in tokens]
-    if not tokens:
-        raise DocketError("editor command is empty")
-    program = shutil.which(tokens[0])
-    if program is None:
-        raise DocketError(f"editor not found: {tokens[0]}")
-    return [program, *tokens[1:]]
+def close(ref: str, *, status: str | None = None, force: bool = False) -> dict[str, Any]:
+    with writing() as s:
+        task = s.get(ref)
+        closed = s.config.closed_statuses
+        target = status or closed[0]
+        if target not in closed:
+            raise DocketError(f"'{target}' is not a closed status; use one of: {', '.join(closed)}")
+        if task.status == target:
+            raise DocketError(f"{task.id} is already {target}")
+        _set_status(s, task, target, force)
+        _save(task)
+        return s.object(task)
 
 
-def edit(conn: sqlite3.Connection, ref: str) -> dict[str, Any]:
-    """Edit the body in $VISUAL or $EDITOR; save only if it changed."""
-    editor = os.environ.get("VISUAL") or os.environ.get("EDITOR")
-    if not editor:
-        raise DocketError("set $VISUAL or $EDITOR to edit a task")
-    argv = _editor_argv(editor)
-    task = get(conn, resolve_id(conn, ref))
-    fd, name = tempfile.mkstemp(suffix=".md", prefix=f"docket-{task['id']}-")
-    path = Path(name)
-    try:
-        with os.fdopen(fd, "wb") as f:
-            f.write(task["body"].encode("utf-8"))
-        try:
-            proc = subprocess.run([*argv, name], check=False)
-        except OSError as e:
-            raise DocketError(f"could not run editor: {e}") from e
-        if proc.returncode != 0:
-            raise DocketError(f"editor exited with status {proc.returncode}; body not saved")
-        try:
-            new_body = path.read_bytes().decode("utf-8").replace("\r\n", "\n")
-        except UnicodeDecodeError as e:
-            raise DocketError("edited body is not valid UTF-8; body not saved") from e
-    except BaseException:
-        path.unlink(missing_ok=True)
-        raise
-    if new_body == task["body"]:
-        path.unlink(missing_ok=True)
-        return task
-    with db.write(conn):
-        if get(conn, task["id"])["body"] != task["body"]:
-            raise DocketError(
-                f"{task['id']} body changed during the edit; not saved. Your edit is in {path}"
-            )
-        conn.execute("UPDATE tasks SET body = ? WHERE id = ?", (new_body, task["id"]))
-        result = get(conn, task["id"])
-    path.unlink(missing_ok=True)
-    return result
+def reopen(ref: str, *, force: bool = False) -> dict[str, Any]:
+    with writing() as s:
+        task = s.get(ref)
+        if not s.is_closed(task):
+            raise DocketError(f"{task.id} is not closed")
+        _set_status(s, task, s.config.default_status, force)
+        _save(task)
+        return s.object(task)
 
 
-def attach(conn: sqlite3.Connection, ref: str, paths: Sequence[str]) -> dict[str, Any]:
-    sources = [Path(p) for p in paths]
-    copied: list[Path] = []
-    try:
-        with db.write(conn):
-            task_id = resolve_id(conn, ref)
-            root = task_id.split(".", 1)[0]
-            folder = db.store_path() / "attachments" / root
-            # Casefolded: Windows and macOS filesystems treat names case-insensitively.
-            existing = {p.name.casefold() for p in folder.iterdir()} if folder.exists() else set()
-            seen: set[str] = set()
-            for src in sources:
-                if not src.is_file():
-                    raise DocketError(f"not a file: {src}")
-                key = src.name.casefold()
-                if key in seen:
-                    raise DocketError(f"duplicate attachment name: {src.name}")
-                if key in existing:
-                    raise DocketError(f"attachment already exists: attachments/{root}/{src.name}")
-                seen.add(key)
-            folder.mkdir(parents=True, exist_ok=True)
-            for src in sources:
-                dest = folder / src.name
-                shutil.copy2(src, dest)
-                copied.append(dest)
-            conn.executemany(
-                "INSERT OR IGNORE INTO task_links(task_id, link) VALUES (?, ?)",
-                [(task_id, f"attachments/{root}/{s.name}") for s in sources],
-            )
-            return get(conn, task_id)
-    except BaseException:
-        for dest in copied:
-            dest.unlink(missing_ok=True)
-        raise
+def dep(ref: str, dep_ref: str) -> dict[str, Any]:
+    with writing() as s:
+        task = s.get(ref)
+        target = s.get(dep_ref)
+        if target.id == task.id:
+            raise DocketError("a task cannot depend on itself")
+        if target.id in task.deps:
+            raise DocketError(f"{task.id} already depends on {target.id}")
+        loop = s.graph.dep_path(target.id, task.id)
+        if loop:
+            raise DocketError(f"dependency cycle: {' -> '.join([task.id, *loop])}")
+        task.meta["deps"] = [*task.deps, target.id]
+        _save(task)
+        return s.object(task)
 
 
-def read_body(file: str | None) -> str:
-    """Body for `add`: --file, else stdin when it is not a TTY, else empty."""
-    if file:
-        try:
-            raw = Path(file).read_bytes()
-        except OSError as e:
-            raise DocketError(f"cannot read {file}: {e.strerror or e}") from e
-    elif sys.stdin is not None and not sys.stdin.isatty():
-        raw = sys.stdin.buffer.read()
-    else:
-        return ""
-    try:
-        return raw.decode("utf-8").replace("\r\n", "\n")
-    except UnicodeDecodeError as e:
-        raise DocketError("body is not valid UTF-8") from e
+def undep(ref: str, dep_ref: str) -> dict[str, Any]:
+    """Match DEP_REF against the task's own deps, so a dep on a missing task can go too."""
+    with writing() as s:
+        task = s.get(ref)
+        target = _match(dep_ref, task.deps, f"{task.id} does not depend on '{dep_ref}'")
+        task.meta["deps"] = [d for d in task.deps if d != target]
+        _save(task)
+        return s.object(task)
 
 
-# --- reads ---
+def note(ref: str, text: str) -> dict[str, Any]:
+    text = text.rstrip()
+    if not text:
+        raise DocketError("note text is empty")
+    with writing() as s:
+        task = s.get(ref)
+        _, body = read_file(task.path)
+        if body and not body.endswith(b"\n"):
+            body += b"\n"
+        body += f"\n**{now()}** {text}\n".encode()
+        atomic_write(task.path, dump(task.meta) + body)
+        return s.object(task)
 
 
-def ls(
-    conn: sqlite3.Connection,
-    scope: Scope,
-    *,
-    tag: str | None = None,
-    status: str | None = None,
-    archived: bool = False,
-) -> list[dict[str, Any]]:
-    if status is not None and status not in STATUSES:
-        raise DocketError(f"invalid status '{status}'; use {', '.join(STATUSES)}")
-    clause, params = _scope_sql(scope)
-    where = [clause]
-    if not archived:
-        where.append("t.archived IS NULL")
-    if tag:
-        where.append("EXISTS (SELECT 1 FROM task_tags g WHERE g.task_id = t.id AND g.tag = ?)")
-        params.append(tag)
-    if status:
-        where.append("t.status = ?")
-        params.append(status)
-    return _select(
-        conn,
-        " AND ".join(where),
-        params,
-        order="t.archived IS NOT NULL, t.created, t.id",
-        with_ready=True,
-    )
+# --- read commands ---
 
 
-def next_task(
-    conn: sqlite3.Connection, scope: Scope, *, start: bool = False
-) -> dict[str, Any] | None:
-    """Oldest ready task in scope, with a parent summary. `start` also sets it to doing."""
-    clause, params = _scope_sql(scope)
-    where = f"t.id IN (SELECT id FROM ready) AND {clause}"
-
-    def pick() -> dict[str, Any] | None:
-        rows = _select(conn, where, params)
-        if not rows:
-            return None
-        task = rows[0]
-        if start:
-            conn.execute("UPDATE tasks SET status = 'doing' WHERE id = ?", (task["id"],))
-            task = get(conn, task["id"])
-        parent = None
-        if task["parent"]:
-            p = get(conn, task["parent"])
-            parent = {"id": p["id"], "title": p["title"], "status": p["status"]}
-        task["parent_summary"] = parent
-        return task
-
-    if not start:
-        return pick()
-    with db.write(conn):
-        return pick()
-
-
-def search(
-    conn: sqlite3.Connection, query: str, scope: Scope, *, archived: bool = False
-) -> list[dict[str, Any]]:
-    terms = query.split()
-    if not terms:
-        raise DocketError("empty search query")
-    match = " ".join('"' + t.replace('"', '""') + '"' for t in terms)
-    clause, params = _scope_sql(scope)
-    where = ["tasks_fts MATCH ?", clause]
-    if not archived:
-        where.append("t.archived IS NULL")
-    try:
-        return _select(
-            conn,
-            " AND ".join(where),
-            [match, *params],
-            frm="tasks_fts JOIN tasks t ON t.id = tasks_fts.id",
-            order="bm25(tasks_fts, 0.0, 10.0, 1.0), t.created, t.id",
-            with_ready=True,
-        )
-    except sqlite3.OperationalError as e:
-        raise DocketError(f"search failed: {e}") from e
-
-
-def index(conn: sqlite3.Connection, scope: Scope, limit: int = 20) -> dict[str, Any]:
-    """Session summary: doing/review, then ready, capped at `limit`; the rest is a count."""
-    clause, params = _scope_sql(scope)
-    open_tasks = _select(conn, f"t.archived IS NULL AND {clause}", params, with_ready=True)
-    active = sorted(
-        (t for t in open_tasks if t["status"] in ("doing", "review")),
-        key=lambda t: (t["status"] != "doing", t["created"], t["id"]),
-    )
-    ready = [t for t in open_tasks if t["ready"]]
-    listed = active + ready
-    waiting = len(open_tasks) - len(listed)
+def show(s: Snapshot, ref: str) -> dict[str, Any]:
+    """The task object with body and relations, the file text, and a summary per related ID."""
+    task = s.get(ref)
+    raw = task.path.read_bytes()
+    _, body = split(raw)
+    blockers = s.graph.blockers(task)
+    blocking = s.graph.blocking(task)
+    subtasks = s.graph.children(task.id)
+    related = [*([task.parent] if task.parent else []), *blockers, *blocking, *subtasks]
     return {
-        "tasks": listed[:limit],
-        "waiting": waiting,
-        "more": max(len(listed) - limit, 0),
+        "task": s.object(
+            task,
+            body=body.decode("utf-8").replace("\r\n", "\n").lstrip("\n"),
+            blockers=blockers,
+            blocking=blocking,
+            subtasks=subtasks,
+        ),
+        "file": raw.removeprefix(BOM).decode("utf-8").replace("\r\n", "\n"),
+        "related": {i: s.object(s.graph.tasks[i]) if i in s.graph.tasks else None for i in related},
+    }
+
+
+def matches(value: Any, wanted: str) -> bool:
+    """A string equal to WANTED, or a list containing it."""
+    if isinstance(value, list):
+        return any(_as_text(v) == wanted for v in value)
+    return _as_text(value) == wanted
+
+
+def _as_text(value: Any) -> str | None:
+    if isinstance(value, bool):
+        return "true" if value else "false"
+    if isinstance(value, str | int | float):
+        return str(value)
+    return None
+
+
+def select(
+    s: Snapshot,
+    *,
+    states: Iterable[str],
+    status: str | None = None,
+    where: Iterable[tuple[str, str]] = (),
+    tree: bool = False,
+) -> list[dict[str, Any]]:
+    """Task objects in STATES matching every filter, oldest first or as a tree."""
+    states = set(states)
+    where = list(where)
+    found = sorted(
+        (
+            t
+            for t in s.graph.tasks.values()
+            if s.graph.state(t) in states
+            and (status is None or t.status == status)
+            and all(matches(t.meta.get(k), v) for k, v in where)
+        ),
+        key=lambda t: (t.meta["created"], id_key(t.id)),
+    )
+    if tree:
+        found = _tree_order(found)
+    blocked = states == {"blocked"}
+    return [s.object(t, blockers=s.graph.blockers(t)) if blocked else s.object(t) for t in found]
+
+
+def _tree_order(found: list[Task]) -> list[Task]:
+    """Each task followed by its listed descendants, under the nearest listed ancestor."""
+    ids = {t.id for t in found}
+    roots: list[Task] = []
+    kids: dict[str, list[Task]] = defaultdict(list)
+    for t in found:
+        ancestor = t.parent
+        while ancestor is not None and ancestor not in ids:
+            ancestor = parent_id(ancestor)
+        (kids[ancestor] if ancestor else roots).append(t)
+    ordered: list[Task] = []
+
+    def walk(t: Task) -> None:
+        ordered.append(t)
+        for child in sorted(kids[t.id], key=lambda c: id_key(c.id)):
+            walk(child)
+
+    for root in roots:
+        walk(root)
+    return ordered
+
+
+def index(s: Snapshot, limit: int) -> dict[str, Any] | None:
+    """Top-level session summary, or None when the store does not exist."""
+    store = s.location.store
+    if store is None or not store.is_dir():
+        return None
+    top = sorted(
+        (t for t in s.graph.tasks.values() if t.parent is None and not s.is_closed(t)),
+        key=lambda t: (t.meta["created"], t.id),
+    )
+    default = s.config.default_status
+    underway = [t for t in top if t.status != default]
+    ready = [t for t in top if t.status == default and s.graph.state(t) == "ready"]
+    blocked = sum(1 for t in top if t.status == default and s.graph.state(t) == "blocked")
+    shown_underway = underway[:limit]
+    shown_ready = ready[: limit - len(shown_underway)]
+
+    def summary(t: Task) -> dict[str, Any]:
+        open_subtasks = sum(1 for c in s.graph.children(t.id) if s.graph.is_open(c))
+        return s.object(t, open_subtasks=open_subtasks)
+
+    return {
+        "store": str(store),
+        "underway": [summary(t) for t in shown_underway],
+        "ready": [summary(t) for t in shown_ready],
+        "blocked": blocked,
+        "omitted": len(underway) + len(ready) - len(shown_underway) - len(shown_ready),
+    }
+
+
+def where(location: Location | None = None) -> dict[str, str | None]:
+    location = location or discover()
+    return {
+        "store": str(location.store) if location.store else None,
+        "git_dir": str(location.git_dir) if location.git_dir else None,
+        "worktree": str(location.worktree) if location.worktree else None,
     }

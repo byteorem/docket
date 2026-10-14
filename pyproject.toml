@@ -1,10 +1,12 @@
 [project]
 name = "docket"
 version = "0.1.0"
-description = "Personal local task tracker CLI"
+description = "Local, file-based task tracker CLI"
 readme = "README.md"
 requires-python = ">=3.12"
-dependencies = ["typer"]
+dependencies = [
+    "pyyaml>=6.0.3",
+]
 
 [project.scripts]
 docket = "docket.cli:main"

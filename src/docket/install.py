@@ -10,7 +10,7 @@ import tempfile
 from importlib import resources
 from pathlib import Path
 
-from docket.db import DocketError
+from docket.store import DocketError
 
 HANDLER = {"type": "command", "command": "docket", "args": ["index"]}
 PERMISSION_RULES = ["Bash(docket *)", "PowerShell(docket *)"]

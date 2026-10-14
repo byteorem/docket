@@ -1,533 +1,257 @@
-"""Typer app: argument parsing and text/JSON output. Command logic lives elsewhere."""
+"""Argument parsing and text/JSON output. Command logic lives in the other modules."""
 
 from __future__ import annotations
 
-import functools
+import argparse
 import json
 import sys
 from collections.abc import Callable
-from pathlib import Path
-from typing import Annotated, Any
+from typing import Any
 
-import typer
-
-app = typer.Typer(
-    pretty_exceptions_enable=False,
-    no_args_is_help=True,
-    add_completion=False,
-    help="Personal local task tracker.",
-)
-
-JsonOpt = Annotated[bool, typer.Option("--json", help="Print one JSON value.")]
-RepoOpt = Annotated[
-    str | None, typer.Option("--repo", metavar="KEY", help="Repo key (owner/repo or bare repo).")
-]
-AllReposOpt = Annotated[bool, typer.Option("--all-repos", help="Do not filter by repo.")]
-
-
-@app.callback()
-def _root() -> None:
-    """Personal local task tracker."""
-
-
-def guarded[**P, R](fn: Callable[P, R]) -> Callable[P, R]:
-    """Apply under `@app.command()`: DocketError becomes one stderr line and exit 1."""
-    from docket.db import DocketError
-
-    @functools.wraps(fn)
-    def wrapper(*args: P.args, **kwargs: P.kwargs) -> R:
-        try:
-            return fn(*args, **kwargs)
-        except DocketError as e:
-            typer.echo(str(e), err=True)
-            raise typer.Exit(1) from None
-
-    return wrapper
+DESCRIPTION = "Local task tracker. Each repo keeps its tasks in .git/docket as Markdown files."
+EPILOG = "Every command takes --json. Run `docket help COMMAND` for a command's flags."
 
 
 def emit(data: Any, text: str | Callable[[], str], as_json: bool) -> None:
     if as_json:
-        typer.echo(json.dumps(data, ensure_ascii=False))
-    else:
-        typer.echo(text() if callable(text) else text)
+        print(json.dumps(data, ensure_ascii=False, default=str))
+        return
+    out = text() if callable(text) else text
+    if out:
+        print(out)
 
 
-@app.command()
-@guarded
-def where(repo: RepoOpt = None, as_json: JsonOpt = False) -> None:
-    """Print the store path, current repo key, and the remote it came from."""
-    from docket import db
-    from docket import repo as repo_mod
-
-    key: str | None
-    remote: str | None = None
-    if repo:
-        conn = db.connect()
-        try:
-            key = repo_mod.resolve_key(conn, repo)
-        finally:
-            conn.close()
-        source = "(from --repo)"
-    else:
-        info = repo_mod.detect()
-        key = info.key if info else None
-        remote = info.remote if info else None
-        if info is None:
-            source = "-"
-        elif remote is None:
-            source = "no origin"
-            warn_no_origin(info)
-        else:
-            source = remote
-
-    store = str(db.store_path())
-    data = {"store": store, "repo": key, "remote": remote}
-    emit(
-        data,
-        lambda: f"store  {store}\nrepo   {key or 'not in a repo'}\nremote {source}",
-        as_json,
-    )
+def _written(action: str, task: dict[str, Any], as_json: bool) -> None:
+    emit({"task": task}, f"{action} {task['id']}  {task['title']}", as_json)
 
 
-# --- task commands ---
-
-TagOpt = Annotated[list[str] | None, typer.Option("--tag", help="Tag (repeatable).")]
-DepOpt = Annotated[list[str] | None, typer.Option("--dep", metavar="ID", help="Repeatable.")]
-AddRepoOpt = Annotated[
-    list[str] | None, typer.Option("--repo", metavar="KEY", help="Repo key (repeatable).")
-]
+def _warn_invalid(s: Any) -> None:
+    if s.invalid:
+        count = len(s.invalid)
+        files = "file" if count == 1 else "files"
+        print(f"warning: skipped {count} invalid task {files}; run docket check", file=sys.stderr)
 
 
-def warn_no_origin(info: Any) -> None:
-    if info is not None and info.remote is None:
-        typer.echo(
-            f"warning: no origin remote; using folder name '{info.key}' as the repo key", err=True
-        )
+def _rows(tasks: list[dict[str, Any]], tree: bool = False) -> str:
+    """One line per task: ID, state, status, title."""
+    from docket.graph import parent_id
 
+    ids = {t["id"] for t in tasks}
 
-def _scope(conn: Any, repo: str | None, all_repos: bool) -> Any:
-    from docket import repo as repo_mod
+    def label(t: dict[str, Any]) -> str:
+        depth = 0
+        ancestor = t["parent"] if tree else None
+        while ancestor is not None:
+            depth += ancestor in ids
+            ancestor = parent_id(ancestor)
+        return "  " * depth + t["id"]
 
-    if all_repos or repo:
-        return repo_mod.scope(conn, repo, all_repos)
-    info = repo_mod.detect()
-    warn_no_origin(info)
-    return repo_mod.Scope(key=info.key if info else None, all_repos=False)
-
-
-def _open() -> Any:
-    from contextlib import closing
-
-    from docket import db
-
-    return closing(db.connect())
-
-
-def _repos_text(task: dict[str, Any]) -> str:
-    return ", ".join(task["repos"]) or "(none)"
-
-
-def _written(task: dict[str, Any], as_json: bool) -> None:
-    emit(task, f"{task['id']}  repos: {_repos_text(task)}", as_json)
-
-
-def _task_text(task: dict[str, Any], parent_summary: dict[str, Any] | None = None) -> str:
+    labels = [label(t) for t in tasks]
+    id_width = max(map(len, labels), default=0)
+    state_width = max((len(t["state"]) for t in tasks), default=0)
+    status_width = max((len(t["status"]) for t in tasks), default=0)
     lines = []
-    for key, value in task.items():
-        if key in ("body", "ready", "parent_summary") or value in (None, "", []):
-            continue
-        shown = ", ".join(value) if isinstance(value, list) else value
-        lines.append(f"{key}: {shown}")
-        if key == "parent" and parent_summary:
-            lines[-1] += f" ({parent_summary['title']}; {parent_summary['status']})"
-    if task["body"]:
-        lines += ["", task["body"]]
+    for name, t in zip(labels, tasks, strict=True):
+        line = f"{name:<{id_width}}  {t['state']:<{state_width}}  {t['status']:<{status_width}}"
+        line += f"  {t['title']}"
+        if "blockers" in t:
+            line += f"  (waiting on {', '.join(t['blockers'])})"
+        lines.append(line)
     return "\n".join(lines)
 
 
-def _entry_lines(tasks: list[dict[str, Any]]) -> list[str]:
-    width = max((len(t["id"]) for t in tasks), default=0)
-    lines = []
-    for t in tasks:
-        state = t["status"] or t["outcome"]
-        mark = "ready" if t.get("ready") else "-"
-        lines.append(f"{t['id']:<{width}}  {state:<8}  {mark:<5}  {t['title']}")
-    return lines
+# --- commands ---
 
 
-def _emit_entries(found: list[dict[str, Any]], as_json: bool) -> None:
-    if found or as_json:
-        emit(found, lambda: "\n".join(_entry_lines(found)), as_json)
-
-
-@app.command()
-@guarded
-def add(
-    title: Annotated[str, typer.Argument(help="Task title.")],
-    parent: Annotated[str | None, typer.Option("--parent", metavar="ID")] = None,
-    dep: DepOpt = None,
-    tag: TagOpt = None,
-    repo: AddRepoOpt = None,
-    no_repo: Annotated[bool, typer.Option("--no-repo", help="Put the task in no repo.")] = False,
-    from_: Annotated[str | None, typer.Option("--from", metavar="ID")] = None,
-    file: Annotated[str | None, typer.Option("--file", help="Read the body from PATH.")] = None,
-    as_json: JsonOpt = False,
-) -> None:
-    """Create a task. Body from --file or stdin."""
-    from docket import repo as repo_mod
+def cmd_create(args: argparse.Namespace) -> None:
     from docket import tasks
 
-    if repo and no_repo:
-        raise typer.BadParameter("--repo and --no-repo are mutually exclusive")
-    with _open() as conn:
-        if no_repo:
-            repos: list[str] = []
-        elif repo:
-            repos = [repo_mod.resolve_key(conn, r) for r in repo]
-        else:
-            info = repo_mod.detect()
-            warn_no_origin(info)
-            repos = [info.key] if info else []
-        body = tasks.read_body(file)
-        task = tasks.add(
-            conn,
-            title,
-            body=body,
-            parent=parent,
-            deps=dep or [],
-            tags=tag or [],
-            repos=repos,
-            discovered_from=from_,
-        )
-    _written(task, as_json)
+    task = tasks.create(
+        args.title,
+        parent=args.parent,
+        deps=args.dep,
+        fields=args.set,
+        body=_read_text(args.file) if args.file else _read_stdin(),
+    )
+    _written("created", task, args.json)
 
 
-@app.command()
-@guarded
-def show(id: Annotated[str, typer.Argument()], as_json: JsonOpt = False) -> None:
-    """Print a task with its fields and body."""
+def cmd_show(args: argparse.Namespace) -> None:
     from docket import tasks
 
-    with _open() as conn:
-        task = tasks.get(conn, tasks.resolve_id(conn, id))
-    emit(task, lambda: _task_text(task), as_json)
-
-
-@app.command()
-@guarded
-def ls(
-    tag: Annotated[str | None, typer.Option("--tag")] = None,
-    status: Annotated[str | None, typer.Option("--status")] = None,
-    archived: Annotated[bool, typer.Option("--archived", help="Include archived tasks.")] = False,
-    repo: RepoOpt = None,
-    all_repos: AllReposOpt = False,
-    as_json: JsonOpt = False,
-) -> None:
-    """List tasks in scope with status and ready state."""
-    from docket import tasks
-
-    with _open() as conn:
-        found = tasks.ls(
-            conn, _scope(conn, repo, all_repos), tag=tag, status=status, archived=archived
-        )
-    _emit_entries(found, as_json)
-
-
-@app.command(name="next")
-@guarded
-def next_(
-    start: Annotated[bool, typer.Option("--start", help="Also set the task to doing.")] = False,
-    repo: RepoOpt = None,
-    all_repos: AllReposOpt = False,
-    as_json: JsonOpt = False,
-) -> None:
-    """Print the oldest ready task in scope."""
-    from docket import tasks
-
-    with _open() as conn:
-        task = tasks.next_task(conn, _scope(conn, repo, all_repos), start=start)
-    if task is None:
-        if as_json:
-            typer.echo("null")
-        return
-    emit(task, lambda: _task_text(task, task["parent_summary"]), as_json)
-
-
-@app.command(name="set")
-@guarded
-def set_(
-    id: Annotated[str, typer.Argument()],
-    field: Annotated[str, typer.Argument()],
-    value: Annotated[str | None, typer.Argument()] = None,
-    add: Annotated[list[str] | None, typer.Option("--add", metavar="V")] = None,
-    remove: Annotated[list[str] | None, typer.Option("--remove", metavar="V")] = None,
-    as_json: JsonOpt = False,
-) -> None:
-    """Set a field. Lists (tags, repos, links): a value replaces; --add/--remove edit."""
-    from docket import tasks
-
-    if field in tasks.LIST_FIELDS:
-        if value is None and not add and not remove:
-            raise typer.BadParameter(f"{field} needs a value, --add, or --remove")
-    elif field in tasks.SCALAR_FIELDS:
-        if value is None:
-            raise typer.BadParameter(f"{field} needs a value")
-        if add or remove:
-            raise typer.BadParameter(
-                f"--add and --remove only apply to {', '.join(tasks.LIST_FIELDS)}"
-            )
-    else:
-        fields = ", ".join([*tasks.SCALAR_FIELDS, *tasks.LIST_FIELDS])
-        raise typer.BadParameter(f"unknown field '{field}'; use {fields}")
-    with _open() as conn:
-        task = tasks.set_field(conn, id, field, value, add or [], remove or [])
-    _written(task, as_json)
-
-
-@app.command()
-@guarded
-def edit(id: Annotated[str, typer.Argument()], as_json: JsonOpt = False) -> None:
-    """Edit the body in $VISUAL or $EDITOR."""
-    from docket import tasks
-
-    with _open() as conn:
-        task = tasks.edit(conn, id)
-    _written(task, as_json)
-
-
-@app.command()
-@guarded
-def note(
-    id: Annotated[str, typer.Argument()],
-    text: Annotated[str, typer.Argument()],
-    as_json: JsonOpt = False,
-) -> None:
-    """Append a timestamped line to the body."""
-    from docket import tasks
-
-    with _open() as conn:
-        task = tasks.note(conn, id, text)
-    _written(task, as_json)
-
-
-@app.command()
-@guarded
-def dep(
-    id: Annotated[str, typer.Argument()],
-    dep_id: Annotated[str, typer.Argument()],
-    as_json: JsonOpt = False,
-) -> None:
-    """Add a dependency: ID waits on DEP_ID."""
-    from docket import tasks
-
-    with _open() as conn:
-        task = tasks.dep(conn, id, dep_id)
-    _written(task, as_json)
-
-
-@app.command()
-@guarded
-def undep(
-    id: Annotated[str, typer.Argument()],
-    dep_id: Annotated[str, typer.Argument()],
-    as_json: JsonOpt = False,
-) -> None:
-    """Remove a dependency."""
-    from docket import tasks
-
-    with _open() as conn:
-        task = tasks.undep(conn, id, dep_id)
-    _written(task, as_json)
-
-
-@app.command()
-@guarded
-def attach(
-    id: Annotated[str, typer.Argument()],
-    paths: Annotated[list[str], typer.Argument(metavar="PATH...")],
-    as_json: JsonOpt = False,
-) -> None:
-    """Copy files into the task's attachment folder and link them."""
-    from docket import tasks
-
-    with _open() as conn:
-        task = tasks.attach(conn, id, paths)
-    _written(task, as_json)
-
-
-@app.command()
-@guarded
-def complete(id: Annotated[str, typer.Argument()], as_json: JsonOpt = False) -> None:
-    """Archive with outcome done."""
-    from docket import tasks
-
-    with _open() as conn:
-        task = tasks.complete(conn, id)
-    _written(task, as_json)
-
-
-@app.command()
-@guarded
-def cancel(id: Annotated[str, typer.Argument()], as_json: JsonOpt = False) -> None:
-    """Archive with outcome canceled."""
-    from docket import tasks
-
-    with _open() as conn:
-        task = tasks.cancel(conn, id)
-    _written(task, as_json)
-
-
-@app.command()
-@guarded
-def reopen(id: Annotated[str, typer.Argument()], as_json: JsonOpt = False) -> None:
-    """Return an archived task to open (status doing)."""
-    from docket import tasks
-
-    with _open() as conn:
-        task = tasks.reopen(conn, id)
-    _written(task, as_json)
-
-
-@app.command()
-@guarded
-def search(
-    query: Annotated[str, typer.Argument()],
-    archived: Annotated[bool, typer.Option("--archived", help="Include archived tasks.")] = False,
-    repo: RepoOpt = None,
-    all_repos: AllReposOpt = False,
-    as_json: JsonOpt = False,
-) -> None:
-    """Full-text search in scope, best match first."""
-    from docket import tasks
-
-    with _open() as conn:
-        found = tasks.search(conn, query, _scope(conn, repo, all_repos), archived=archived)
-    _emit_entries(found, as_json)
-
-
-@app.command()
-def index(
-    limit: Annotated[int, typer.Option("--limit", min=0, help="Max tasks listed.")] = 20,
-    repo: RepoOpt = None,
-    all_repos: AllReposOpt = False,
-    as_json: JsonOpt = False,
-) -> None:
-    """Print the session summary. Always exits 0."""
-    from docket import tasks
-
-    try:
-        with _open() as conn:
-            scope = _scope(conn, repo, all_repos)
-            data = tasks.index(conn, scope, limit)
-        if scope.all_repos:
-            header = "all repos"
-        elif scope.key:
-            header = f"repo {scope.key}"
-        else:
-            header = "no repo"
-        data = {"repo": scope.key, "all_repos": scope.all_repos, **data}
-
-        def text() -> str:
-            listed = data["tasks"]
-            width = max((len(t["id"]) for t in listed), default=0)
-            lines = [header]
-            for t in listed:
-                state = "ready" if t["ready"] else t["status"]
-                lines.append(f"  {state:<7} {t['id']:<{width}}  {t['title']}")
-            if data["more"]:
-                lines.append(f"  +{data['more']} more")
-            if data["waiting"]:
-                lines.append(f"  +{data['waiting']} waiting")
-            return "\n".join(lines)
-
-        emit(data, text, as_json)
-    except Exception as e:
-        typer.echo(f"docket index: {e}", err=True)
-
-
-# --- maintenance and install commands ---
-
-
-@app.command()
-@guarded
-def doctor(as_json: JsonOpt = False) -> None:
-    """Check store integrity; exit 1 when anything is found."""
-    from docket import checks, db
-
-    conn = db.connect()
-    try:
-        data = checks.doctor(conn)
-    finally:
-        conn.close()
+    data = tasks.show(tasks.snapshot(), args.id)
 
     def text() -> str:
-        lines = [f"integrity: {m}" for m in data["integrity"]]
-        lines += [
-            f"foreign key: {r['table']} rowid {r['rowid']} -> missing {r['parent']}"
-            for r in data["foreign_keys"]
-        ]
-        lines += [f"orphan attachment folder: {d}" for d in data["orphan_attachment_dirs"]]
-        lines += [
-            f"missing attachment: {m['task']} {m['link']}" for m in data["missing_attachments"]
-        ]
-        return "\n".join(lines) or "ok"
+        task, related = data["task"], data["related"]
+        out = [data["file"].rstrip("\n")]
+        sections = {
+            "Parent": [task["parent"]] if task["parent"] else [],
+            "Blockers": task["blockers"],
+            "Blocking": task["blocking"],
+            "Subtasks": task["subtasks"],
+        }
+        for heading, ids in sections.items():
+            if not ids:
+                continue
+            found = [related[i] for i in ids if related[i] is not None]
+            lines = _rows(found).splitlines() if found else []
+            lines += [f"{i}  missing" for i in ids if related[i] is None]
+            out += ["", f"{heading}:", *(f"  {line}" for line in lines)]
+        return "\n".join(out)
 
-    emit(data, text, as_json)
-    if not data["ok"]:
-        raise typer.Exit(1)
-
-
-@app.command()
-@guarded
-def export(
-    fmt: Annotated[str, typer.Option("--format", help="jsonl or md.")] = "jsonl",
-    out: Annotated[Path | None, typer.Option("--out", help="Output folder.")] = None,
-    as_json: JsonOpt = False,
-) -> None:
-    """Dump all tasks: jsonl to stdout or DIR/docket.jsonl; md files need --out."""
-    from docket import checks
-
-    if fmt not in ("jsonl", "md"):
-        raise typer.BadParameter("use jsonl or md", param_hint="--format")
-    if fmt == "md" and out is None:
-        raise typer.BadParameter("md export needs --out", param_hint="--out")
-    with _open() as conn:
-        data = checks.export(conn, fmt, out)
-    if out is None:
-        if as_json:
-            typer.echo(json.dumps(data["tasks"], ensure_ascii=False))
-        else:
-            for t in data["tasks"]:
-                typer.echo(json.dumps(t, ensure_ascii=False))
-        return
-    summary = {k: data[k] for k in ("format", "path", "count")}
-    emit(summary, f"exported {data['count']} tasks to {data['path']}", as_json)
+    emit(data["task"], text, args.json)
 
 
-install_app = typer.Typer(no_args_is_help=True, help="Install agent integration.")
-app.add_typer(install_app, name="install")
+def cmd_path(args: argparse.Namespace) -> None:
+    from docket import tasks
+
+    s = tasks.snapshot()
+    path = str(s.paths[s.resolve(args.id)])
+    emit({"path": path}, path, args.json)
 
 
-@install_app.command("skill")
-@guarded
-def install_skill(
-    dir: Annotated[
-        Path | None,
-        typer.Option("--dir", help="Skills folder to install into (default ~/.claude/skills)."),
-    ] = None,
-    as_json: JsonOpt = False,
-) -> None:
-    """Write the bundled skill to <dir>/docket/SKILL.md."""
+def _list(args: argparse.Namespace, states: tuple[str, ...], tree: bool = False) -> None:
+    from docket import tasks
+
+    s = tasks.snapshot()
+    found = tasks.select(s, states=states, status=args.status, where=args.where, tree=tree)
+    _warn_invalid(s)
+    emit(found, lambda: _rows(found, tree), args.json)
+
+
+def cmd_ls(args: argparse.Namespace) -> None:
+    states = ("ready", "blocked", "closed") if args.all else ("ready", "blocked")
+    _list(args, states, args.tree)
+
+
+def cmd_ready(args: argparse.Namespace) -> None:
+    _list(args, ("ready",))
+
+
+def cmd_blocked(args: argparse.Namespace) -> None:
+    _list(args, ("blocked",))
+
+
+def cmd_set(args: argparse.Namespace) -> None:
+    from docket import tasks
+
+    _written("updated", tasks.set_field(args.id, args.key, args.value), args.json)
+
+
+def cmd_unset(args: argparse.Namespace) -> None:
+    from docket import tasks
+
+    _written("updated", tasks.unset_field(args.id, args.key), args.json)
+
+
+def cmd_add(args: argparse.Namespace) -> None:
+    from docket import tasks
+
+    _written("updated", tasks.add_value(args.id, args.key, args.value), args.json)
+
+
+def cmd_remove(args: argparse.Namespace) -> None:
+    from docket import tasks
+
+    _written("updated", tasks.remove_value(args.id, args.key, args.value), args.json)
+
+
+def cmd_close(args: argparse.Namespace) -> None:
+    from docket import tasks
+
+    _written("closed", tasks.close(args.id, status=args.status, force=args.force), args.json)
+
+
+def cmd_reopen(args: argparse.Namespace) -> None:
+    from docket import tasks
+
+    _written("reopened", tasks.reopen(args.id, force=args.force), args.json)
+
+
+def cmd_dep(args: argparse.Namespace) -> None:
+    from docket import tasks
+
+    _written("updated", tasks.dep(args.id, args.dep_id), args.json)
+
+
+def cmd_undep(args: argparse.Namespace) -> None:
+    from docket import tasks
+
+    _written("updated", tasks.undep(args.id, args.dep_id), args.json)
+
+
+def cmd_note(args: argparse.Namespace) -> None:
+    from docket import tasks
+
+    text = args.text if args.text is not None else _read_stdin()
+    _written("noted", tasks.note(args.id, text), args.json)
+
+
+def cmd_where(args: argparse.Namespace) -> None:
+    from docket import tasks
+
+    data = tasks.where()
+    emit(
+        data,
+        lambda: "\n".join(f"{k:<9} {v or '-'}" for k, v in data.items()),
+        args.json,
+    )
+
+
+def cmd_index(args: argparse.Namespace) -> None:
+    """Runs from the SessionStart hook, so it reports any failure and still exits 0."""
+    try:
+        from docket import tasks
+
+        s = tasks.snapshot()
+        data = tasks.index(s, args.limit)
+        if data is None:
+            return
+
+        def text() -> str:
+            listed = data["underway"] + data["ready"]
+            id_width = max((len(t["id"]) for t in listed), default=0)
+            title_width = max((len(t["title"]) for t in listed), default=0)
+            status_width = max((len(t["status"]) for t in listed), default=0)
+            lines = [f"store {data['store']}"]
+            for t in listed:
+                line = f"  {t['state']:<8} {t['id']:<{id_width}}  {t['title']:<{title_width}}"
+                line += f"  {t['status']:<{status_width}}"
+                count = t["open_subtasks"]
+                if count:
+                    line += f"  ({count} open subtask{'' if count == 1 else 's'})"
+                lines.append(line.rstrip())
+            if data["omitted"]:
+                lines.append(f"  +{data['omitted']} more")
+            if data["blocked"]:
+                lines.append(f"  +{data['blocked']} blocked")
+            return "\n".join(lines)
+
+        _warn_invalid(s)
+        emit(data, text, args.json)
+    except Exception as e:
+        print(f"docket index: {e}", file=sys.stderr)
+
+
+def cmd_check(args: argparse.Namespace) -> int:
+    from docket import checks, tasks
+
+    data = checks.check(tasks.snapshot())
+    problems = data["problems"]
+    emit(data, lambda: "\n".join(f"{p['kind']}: {p['message']}" for p in problems), args.json)
+    return 1 if problems else 0
+
+
+def cmd_install_skill(args: argparse.Namespace) -> None:
+    from pathlib import Path
+
     from docket import install
 
-    data = install.install_skill(dir)
-    emit(data, f"wrote {data['path']}", as_json)
+    data = install.install_skill(Path(args.dir) if args.dir else None)
+    emit(data, f"wrote {data['path']}", args.json)
 
 
-@install_app.command("hook")
-@guarded
-def install_hook(as_json: JsonOpt = False) -> None:
-    """Add the SessionStart hook and docket permission rules to Claude Code settings."""
+def cmd_install_hook(args: argparse.Namespace) -> None:
     from docket import install
 
     data = install.install_hook()
@@ -541,13 +265,188 @@ def install_hook(as_json: JsonOpt = False) -> None:
             lines.append(f"backup   {data['backup']}")
         return "\n".join(lines)
 
-    emit(data, text, as_json)
+    emit(data, text, args.json)
     warning = install.path_warning()
     if warning:
-        typer.echo(warning, err=True)
+        print(warning, file=sys.stderr)
+
+
+# --- parsing ---
+
+
+def _pair(text: str) -> tuple[str, str]:
+    key, sep, value = text.partition("=")
+    if not sep or not key:
+        raise argparse.ArgumentTypeError(f"expected KEY=VALUE, got '{text}'")
+    return key, value
+
+
+def _count(text: str) -> int:
+    if not text.isdigit():
+        raise argparse.ArgumentTypeError(f"expected a whole number, got '{text}'")
+    return int(text)
+
+
+def _read_text(path: str) -> str:
+    from pathlib import Path
+
+    return Path(path).read_text(encoding="utf-8-sig")
+
+
+def _read_stdin() -> str:
+    if sys.stdin is None or sys.stdin.isatty():
+        return ""
+    return sys.stdin.read()
+
+
+def build_parser() -> argparse.ArgumentParser:
+    common = argparse.ArgumentParser(add_help=False)
+    common.add_argument("--json", action="store_true", help="print one JSON value")
+    parser = argparse.ArgumentParser(
+        prog="docket", description=DESCRIPTION, epilog=EPILOG, allow_abbrev=False
+    )
+    sub = parser.add_subparsers(dest="command", metavar="COMMAND")
+
+    def command(name: str, handler: Callable[..., Any], summary: str) -> argparse.ArgumentParser:
+        p = sub.add_parser(
+            name, help=summary, description=summary, parents=[common], allow_abbrev=False
+        )
+        p.set_defaults(handler=handler)
+        return p
+
+    def filters(p: argparse.ArgumentParser) -> None:
+        p.add_argument("--status", metavar="S", help="only tasks with status S")
+        p.add_argument(
+            "--where",
+            metavar="K=V",
+            type=_pair,
+            action="append",
+            default=[],
+            help="only tasks whose field K is V or a list containing V (repeatable)",
+        )
+
+    p = command("create", cmd_create, "Create a task; body from stdin or --file. Prints the ID.")
+    p.add_argument("title")
+    p.add_argument("--parent", metavar="ID", help="create a subtask of ID")
+    p.add_argument("--dep", metavar="ID", action="append", default=[], help="repeatable")
+    p.add_argument(
+        "--set", metavar="K=V", type=_pair, action="append", default=[], help="repeatable"
+    )
+    p.add_argument("--file", metavar="PATH", help="read the body from PATH")
+
+    p = command("show", cmd_show, "Print the task file, then parent, blockers, and subtasks.")
+    p.add_argument("id")
+
+    p = command("path", cmd_path, "Print the task file's absolute path.")
+    p.add_argument("id")
+
+    p = command("ls", cmd_ls, "List open tasks.")
+    filters(p)
+    p.add_argument("--all", action="store_true", help="include closed tasks")
+    p.add_argument("--tree", action="store_true", help="indent subtasks under their parent")
+
+    p = command("ready", cmd_ready, "List ready tasks: open, with every dep closed.")
+    filters(p)
+
+    p = command("blocked", cmd_blocked, "List blocked tasks with their open deps.")
+    filters(p)
+
+    p = command("set", cmd_set, "Set title, status, or a user field.")
+    p.add_argument("id")
+    p.add_argument("key")
+    p.add_argument("value")
+
+    p = command("unset", cmd_unset, "Remove a user field.")
+    p.add_argument("id")
+    p.add_argument("key")
+
+    p = command("add", cmd_add, "Add VALUE to the list field KEY.")
+    p.add_argument("id")
+    p.add_argument("key")
+    p.add_argument("value")
+
+    p = command("remove", cmd_remove, "Remove VALUE from the list field KEY.")
+    p.add_argument("id")
+    p.add_argument("key")
+    p.add_argument("value")
+
+    p = command("close", cmd_close, "Close a task with the first closed status, or --status.")
+    p.add_argument("id")
+    p.add_argument("--status", metavar="S", help="a closed status from config")
+    p.add_argument("--force", action="store_true", help="close even with open subtasks")
+
+    p = command("reopen", cmd_reopen, "Reopen a closed task at the default status.")
+    p.add_argument("id")
+    p.add_argument("--force", action="store_true", help="reopen even if the parent is closed")
+
+    p = command("dep", cmd_dep, "Make ID wait on DEP_ID.")
+    p.add_argument("id")
+    p.add_argument("dep_id")
+
+    p = command("undep", cmd_undep, "Remove a dependency.")
+    p.add_argument("id")
+    p.add_argument("dep_id")
+
+    p = command("note", cmd_note, "Append a timestamped note to the body; text from stdin.")
+    p.add_argument("id")
+    p.add_argument("text", nargs="?")
+
+    command("where", cmd_where, "Print the store path, git directory, and worktree root.")
+
+    p = command("index", cmd_index, "Print the session summary. Always exits 0.")
+    p.add_argument("--limit", metavar="N", type=_count, default=20, help="max tasks listed")
+
+    command("check", cmd_check, "Report broken task files, missing deps, and cycles.")
+
+    p = sub.add_parser(
+        "install",
+        help="Install the agent skill or the Claude Code hook.",
+        description="Install the agent skill or the Claude Code hook.",
+        allow_abbrev=False,
+    )
+    targets = p.add_subparsers(dest="target", metavar="TARGET", required=True)
+
+    def target(name: str, handler: Callable[..., Any], summary: str) -> argparse.ArgumentParser:
+        t = targets.add_parser(
+            name, help=summary, description=summary, parents=[common], allow_abbrev=False
+        )
+        t.set_defaults(handler=handler)
+        return t
+
+    t = target("skill", cmd_install_skill, "Write the bundled skill to <dir>/docket/SKILL.md.")
+    t.add_argument("--dir", metavar="DIR", help="skills folder (default ~/.claude/skills)")
+    target("hook", cmd_install_hook, "Add the SessionStart hook and docket permission rules.")
+
+    def cmd_help(args: argparse.Namespace) -> None:
+        (sub.choices[args.topic] if args.topic else parser).print_help()
+
+    p = sub.add_parser("help", help="Print commands and usage.", add_help=False)
+    p.add_argument("topic", metavar="COMMAND", nargs="?", choices=list(sub.choices))
+    p.set_defaults(handler=cmd_help)
+    return parser
+
+
+def run(argv: list[str] | None = None) -> int:
+    from docket.store import DocketError
+
+    parser = build_parser()
+    try:
+        args = parser.parse_args(argv)
+    except SystemExit as e:
+        return e.code if isinstance(e.code, int) else 2
+    if args.command is None:
+        parser.print_help(sys.stderr)
+        return 2
+    try:
+        return args.handler(args) or 0
+    except DocketError as e:
+        print(e, file=sys.stderr)
+    except OSError as e:
+        print(f"{e.strerror or e}: {e.filename}" if e.filename else str(e), file=sys.stderr)
+    return 1
 
 
 def main() -> None:
-    for stream in (sys.stdout, sys.stderr):
+    for stream in (sys.stdin, sys.stdout, sys.stderr):
         stream.reconfigure(encoding="utf-8")
-    app()
+    sys.exit(run())
