@@ -289,3 +289,22 @@ def test_ready_view(conn):
         "UPDATE tasks SET status = NULL, outcome = 'done', archived = ? WHERE id = 'dep'", (done,)
     )
     assert ready_ids(conn) == {"blocked-by-open", "unblocked", "parent.1", "anc.1.1"}
+
+
+def test_failed_backup_leaves_no_final_or_temp_file(home, conn, monkeypatch):
+    def boom(src, dst):
+        raise OSError("disk full")
+
+    monkeypatch.setattr(db.os, "replace", boom)
+    with pytest.raises(OSError), db.write(conn):
+        pass
+    assert list((home / "backups").iterdir()) == []
+    assert not conn.in_transaction
+
+
+def test_prune_ignores_tmp_files(home, conn):
+    tmp = home / "backups" / "docket-2026-01-01.db.123.tmp"
+    tmp.write_bytes(b"")
+    with db.write(conn):
+        pass
+    assert tmp.exists()
