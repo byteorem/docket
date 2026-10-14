@@ -456,13 +456,21 @@ def edit(conn: sqlite3.Connection, ref: str) -> dict[str, Any]:
             new_body = path.read_bytes().decode("utf-8").replace("\r\n", "\n")
         except UnicodeDecodeError as e:
             raise DocketError("edited body is not valid UTF-8; body not saved") from e
-    finally:
+    except BaseException:
         path.unlink(missing_ok=True)
+        raise
     if new_body == task["body"]:
+        path.unlink(missing_ok=True)
         return task
     with db.write(conn):
+        if get(conn, task["id"])["body"] != task["body"]:
+            raise DocketError(
+                f"{task['id']} body changed during the edit; not saved. Your edit is in {path}"
+            )
         conn.execute("UPDATE tasks SET body = ? WHERE id = ?", (new_body, task["id"]))
-        return get(conn, task["id"])
+        result = get(conn, task["id"])
+    path.unlink(missing_ok=True)
+    return result
 
 
 def attach(conn: sqlite3.Connection, ref: str, paths: Sequence[str]) -> dict[str, Any]:

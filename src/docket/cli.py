@@ -472,6 +472,33 @@ def doctor(as_json: JsonOpt = False) -> None:
         raise typer.Exit(1)
 
 
+@app.command()
+@guarded
+def export(
+    fmt: Annotated[str, typer.Option("--format", help="jsonl or md.")] = "jsonl",
+    out: Annotated[Path | None, typer.Option("--out", help="Output folder.")] = None,
+    as_json: JsonOpt = False,
+) -> None:
+    """Dump all tasks: jsonl to stdout or DIR/docket.jsonl; md files need --out."""
+    from docket import checks
+
+    if fmt not in ("jsonl", "md"):
+        raise typer.BadParameter("use jsonl or md", param_hint="--format")
+    if fmt == "md" and out is None:
+        raise typer.BadParameter("md export needs --out", param_hint="--out")
+    with _open() as conn:
+        data = checks.export(conn, fmt, out)
+    if out is None:
+        if as_json:
+            typer.echo(json.dumps(data["tasks"], ensure_ascii=False))
+        else:
+            for t in data["tasks"]:
+                typer.echo(json.dumps(t, ensure_ascii=False))
+        return
+    summary = {k: data[k] for k in ("format", "path", "count")}
+    emit(summary, f"exported {data['count']} tasks to {data['path']}", as_json)
+
+
 install_app = typer.Typer(no_args_is_help=True, help="Install agent integration.")
 app.add_typer(install_app, name="install")
 
