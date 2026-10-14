@@ -246,3 +246,57 @@ def test_two_processes_start_the_same_task_once(home, plain, run):
     results = [json.loads(o) for o, _ in outs]
     got = [r for r in results if r is not None]
     assert len(got) == 1 and got[0]["id"] == a and got[0]["status"] == "doing"
+
+
+def test_attach_names_collide_case_insensitively(home, plain, run, tmp_path):
+    (tmp_path / "d1").mkdir()
+    (tmp_path / "d2").mkdir()
+    upper = tmp_path / "d1" / "A.txt"
+    lower = tmp_path / "d2" / "a.txt"
+    upper.write_text("1", encoding="utf-8")
+    lower.write_text("2", encoding="utf-8")
+    a = mk(run, plain, "x")
+    assert "duplicate" in fail(run, plain, "attach", a, str(upper), str(lower))
+    assert not (home / "attachments" / a).exists()
+    js(run, plain, "attach", a, str(upper))
+    assert "already exists" in fail(run, plain, "attach", a, str(lower))
+    assert (home / "attachments" / a / "A.txt").read_text(encoding="utf-8") == "1"
+
+
+def test_dep_rejects_archived_source(home, plain, run):
+    a, b = mk(run, plain, "a"), mk(run, plain, "b")
+    run("complete", a, cwd=plain)
+    assert "archived" in fail(run, plain, "dep", a, b)
+    assert js(run, plain, "show", a)["depends_on"] == []
+
+
+def test_empty_ls_and_search_print_nothing(home, plain, run):
+    assert run("ls", cwd=plain).stdout == ""
+    assert run("search", "nothing", cwd=plain).stdout == ""
+    assert js(run, plain, "ls") == []
+
+
+def test_many_processes_add_at_once(home, plain):
+    env = {**os.environ, "DOCKET_HOME": str(home)}
+    count = 6
+    procs = [
+        subprocess.Popen(
+            [sys.executable, "-m", "docket", "add", f"task {i}", "--no-repo"],
+            cwd=plain,
+            env=env,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            stdin=subprocess.DEVNULL,
+            text=True,
+            encoding="utf-8",
+        )
+        for i in range(count)
+    ]
+    outs = [p.communicate() for p in procs]
+    assert [p.returncode for p in procs] == [0] * count, outs
+    conn = db.connect()
+    try:
+        assert conn.execute("SELECT COUNT(*) FROM tasks").fetchone()[0] == count
+    finally:
+        conn.close()
+    assert len(list((home / "backups").glob("docket-*.db"))) == 1
