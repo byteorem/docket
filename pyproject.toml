@@ -1,0 +1,23 @@
+[project]
+name = "docket"
+version = "0.1.0"
+description = "Personal local task tracker CLI"
+requires-python = ">=3.12"
+dependencies = ["typer"]
+
+[project.scripts]
+docket = "docket.cli:main"
+
+[build-system]
+requires = ["uv_build>=0.8,<0.13"]
+build-backend = "uv_build"
+
+[dependency-groups]
+dev = ["pytest", "ruff"]
+
+[tool.ruff]
+line-length = 100
+target-version = "py312"
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "UP", "B"]
