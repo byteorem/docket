@@ -253,6 +253,7 @@ def add(
 def dep(conn: sqlite3.Connection, ref: str, dep_ref: str) -> dict[str, Any]:
     with db.write(conn):
         task_id = resolve_id(conn, ref)
+        _require_open(conn, task_id, "it cannot take dependencies")
         _add_dep(conn, task_id, dep_ref)
         return get(conn, task_id)
 
@@ -481,15 +482,18 @@ def attach(conn: sqlite3.Connection, ref: str, paths: Sequence[str]) -> dict[str
             task_id = resolve_id(conn, ref)
             root = task_id.split(".", 1)[0]
             folder = db.store_path() / "attachments" / root
+            # Casefolded: Windows and macOS filesystems treat names case-insensitively.
+            existing = {p.name.casefold() for p in folder.iterdir()} if folder.exists() else set()
             seen: set[str] = set()
             for src in sources:
                 if not src.is_file():
                     raise DocketError(f"not a file: {src}")
-                if src.name in seen:
+                key = src.name.casefold()
+                if key in seen:
                     raise DocketError(f"duplicate attachment name: {src.name}")
-                if (folder / src.name).exists():
+                if key in existing:
                     raise DocketError(f"attachment already exists: attachments/{root}/{src.name}")
-                seen.add(src.name)
+                seen.add(key)
             folder.mkdir(parents=True, exist_ok=True)
             for src in sources:
                 dest = folder / src.name

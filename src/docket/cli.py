@@ -155,6 +155,11 @@ def _entry_lines(tasks: list[dict[str, Any]]) -> list[str]:
     return lines
 
 
+def _emit_entries(found: list[dict[str, Any]], as_json: bool) -> None:
+    if found or as_json:
+        emit(found, lambda: "\n".join(_entry_lines(found)), as_json)
+
+
 @app.command()
 @guarded
 def add(
@@ -225,7 +230,7 @@ def ls(
         found = tasks.ls(
             conn, _scope(conn, repo, all_repos), tag=tag, status=status, archived=archived
         )
-    emit(found, lambda: "\n".join(_entry_lines(found)), as_json)
+    _emit_entries(found, as_json)
 
 
 @app.command(name="next")
@@ -397,7 +402,7 @@ def search(
 
     with _open() as conn:
         found = tasks.search(conn, query, _scope(conn, repo, all_repos), archived=archived)
-    emit(found, lambda: "\n".join(_entry_lines(found)), as_json)
+    _emit_entries(found, as_json)
 
 
 @app.command()
