@@ -35,13 +35,9 @@ def titles(rows):
 
 def test_ls_scope(world, run):
     repo, plain, _ = world
-    assert titles(js(run, repo, "ls")) == {"api task", "both task", "free task"}
+    assert titles(js(run, repo, "ls")) == {"api task", "both task"}
     assert titles(js(run, plain, "ls")) == {"free task"}
-    assert titles(js(run, plain, "ls", "--repo", "other/repo")) == {
-        "other task",
-        "both task",
-        "free task",
-    }
+    assert titles(js(run, plain, "ls", "--repo", "other/repo")) == {"other task", "both task"}
     assert titles(js(run, plain, "ls", "--repo", "repo")) == titles(
         js(run, plain, "ls", "--repo", "other/repo")
     )
@@ -53,7 +49,6 @@ def test_next_scope(world, run):
     assert js(run, repo, "next")["title"] == "api task"
     assert js(run, plain, "next")["title"] == "free task"
     assert js(run, plain, "next", "--repo", "other/repo")["title"] == "other task"
-    # next does not include repo-less tasks inside a repo
     run("complete", ids["api"], cwd=plain)
     run("complete", ids["both"], cwd=plain)
     assert js(run, repo, "next") is None
@@ -63,13 +58,9 @@ def test_next_scope(world, run):
 
 def test_search_scope(world, run):
     repo, plain, _ = world
-    assert titles(js(run, repo, "search", "task")) == {"api task", "both task", "free task"}
+    assert titles(js(run, repo, "search", "task")) == {"api task", "both task"}
     assert titles(js(run, plain, "search", "task")) == {"free task"}
-    assert titles(js(run, plain, "search", "task", "--repo", "api")) == {
-        "api task",
-        "both task",
-        "free task",
-    }
+    assert titles(js(run, plain, "search", "task", "--repo", "api")) == {"api task", "both task"}
     assert len(js(run, plain, "search", "task", "--all-repos")) == 4
 
 
@@ -80,7 +71,7 @@ def test_index_scope(world, run):
     assert ok(run, plain, "index", "--all-repos").splitlines()[0] == "all repos"
     assert ok(run, plain, "index", "--repo", "other/repo").splitlines()[0] == "repo other/repo"
     assert len(js(run, plain, "index", "--all-repos")["tasks"]) == 4
-    assert len(js(run, repo, "index")["tasks"]) == 3
+    assert titles(js(run, repo, "index")["tasks"]) == {"api task", "both task"}
     assert len(js(run, plain, "index")["tasks"]) == 1
 
 

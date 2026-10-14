@@ -119,17 +119,13 @@ def _require_open(conn: sqlite3.Connection, task_id: str, what: str) -> None:
         raise DocketError(f"{task_id} is archived; {what}")
 
 
-def _scope_sql(scope: Scope, *, with_unscoped: bool) -> tuple[str, list[str]]:
-    """`with_unscoped` also admits tasks that have no repos (ls, search, index)."""
+def _scope_sql(scope: Scope) -> tuple[str, list[str]]:
+    """Tasks in the scope's repo; with no repo key, tasks that have no repos."""
     if scope.all_repos:
         return "1", []
-    no_repo = "NOT EXISTS (SELECT 1 FROM task_repos r WHERE r.task_id = t.id)"
     if scope.key is None:
-        return no_repo, []
-    in_repo = "EXISTS (SELECT 1 FROM task_repos r WHERE r.task_id = t.id AND r.repo = ?)"
-    if with_unscoped:
-        return f"({in_repo} OR {no_repo})", [scope.key]
-    return in_repo, [scope.key]
+        return "NOT EXISTS (SELECT 1 FROM task_repos r WHERE r.task_id = t.id)", []
+    return "EXISTS (SELECT 1 FROM task_repos r WHERE r.task_id = t.id AND r.repo = ?)", [scope.key]
 
 
 # --- cycle rule ---
@@ -540,7 +536,7 @@ def ls(
 ) -> list[dict[str, Any]]:
     if status is not None and status not in STATUSES:
         raise DocketError(f"invalid status '{status}'; use {', '.join(STATUSES)}")
-    clause, params = _scope_sql(scope, with_unscoped=True)
+    clause, params = _scope_sql(scope)
     where = [clause]
     if not archived:
         where.append("t.archived IS NULL")
@@ -563,7 +559,7 @@ def next_task(
     conn: sqlite3.Connection, scope: Scope, *, start: bool = False
 ) -> dict[str, Any] | None:
     """Oldest ready task in scope, with a parent summary. `start` also sets it to doing."""
-    clause, params = _scope_sql(scope, with_unscoped=False)
+    clause, params = _scope_sql(scope)
     where = f"t.id IN (SELECT id FROM ready) AND {clause}"
 
     def pick() -> dict[str, Any] | None:
@@ -594,7 +590,7 @@ def search(
     if not terms:
         raise DocketError("empty search query")
     match = " ".join('"' + t.replace('"', '""') + '"' for t in terms)
-    clause, params = _scope_sql(scope, with_unscoped=True)
+    clause, params = _scope_sql(scope)
     where = ["tasks_fts MATCH ?", clause]
     if not archived:
         where.append("t.archived IS NULL")
@@ -613,7 +609,7 @@ def search(
 
 def index(conn: sqlite3.Connection, scope: Scope, limit: int = 20) -> dict[str, Any]:
     """Session summary: doing/review, then ready, capped at `limit`; the rest is a count."""
-    clause, params = _scope_sql(scope, with_unscoped=True)
+    clause, params = _scope_sql(scope)
     open_tasks = _select(conn, f"t.archived IS NULL AND {clause}", params, with_ready=True)
     active = sorted(
         (t for t in open_tasks if t["status"] in ("doing", "review")),
