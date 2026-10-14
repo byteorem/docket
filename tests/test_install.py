@@ -211,3 +211,13 @@ def test_path_warning(monkeypatch):
     assert "needs `docket` on PATH" in install.path_warning()
     monkeypatch.setattr(install.shutil, "which", lambda name: "C:/bin/docket.exe")
     assert install.path_warning() is None
+
+
+def test_hook_accepts_utf8_bom(settings):
+    raw = write_settings(settings, b"\xef\xbb\xbf" + json.dumps({"model": "opus"}).encode())
+    install.install_hook()
+    data = load(settings)
+    assert data["model"] == "opus"
+    assert data["permissions"]["allow"] == RULES
+    assert not settings.read_bytes().startswith(b"\xef\xbb\xbf")
+    assert settings.with_name("settings.json.bak").read_bytes() == raw

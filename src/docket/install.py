@@ -63,7 +63,7 @@ def install_hook() -> dict:
     if path.exists():
         original = path.read_bytes()
         try:
-            settings = json.loads(original.decode("utf-8"))
+            settings = json.loads(original.decode("utf-8-sig"))
         except ValueError as e:
             raise DocketError(f"{path} is not valid JSON ({e}); fix it and retry") from None
         if not isinstance(settings, dict):
