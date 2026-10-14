@@ -2,9 +2,12 @@
 
 from __future__ import annotations
 
+import json
 import sqlite3
+from pathlib import Path
+from typing import Any
 
-from docket import db
+from docket import db, tasks
 
 
 def doctor(conn: sqlite3.Connection) -> dict:
@@ -38,3 +41,37 @@ def doctor(conn: sqlite3.Connection) -> dict:
         "orphan_attachment_dirs": orphan_dirs,
         "missing_attachments": missing,
     }
+
+
+def _md(task: dict[str, Any]) -> str:
+    lines = ["---"]
+    for key, value in task.items():
+        if key == "body":
+            continue
+        shown = ", ".join(value) if isinstance(value, list) else value
+        lines.append(f"{key}: {'' if shown is None else shown}")
+    return "\n".join([*lines, "---", "", task["body"]])
+
+
+def export(conn: sqlite3.Connection, fmt: str, out: Path | None) -> dict[str, Any]:
+    """Read-only dump of every task. `tasks` is the list; `path` is set when files were written."""
+    if fmt not in ("jsonl", "md"):
+        raise db.DocketError(f"unknown format '{fmt}'; use jsonl or md")
+    all_tasks = tasks.get_all(conn)
+    if out is None:
+        if fmt == "md":
+            raise db.DocketError("md export needs --out")
+        return {"format": fmt, "path": None, "count": len(all_tasks), "tasks": all_tasks}
+    try:
+        out.mkdir(parents=True, exist_ok=True)
+        if fmt == "jsonl":
+            path = out / "docket.jsonl"
+            lines = [json.dumps(t, ensure_ascii=False) + "\n" for t in all_tasks]
+            path.write_bytes("".join(lines).encode("utf-8"))
+        else:
+            path = out
+            for t in all_tasks:
+                (out / f"{t['id']}.md").write_bytes(_md(t).encode("utf-8"))
+    except OSError as e:
+        raise db.DocketError(f"cannot write to {out}: {e.strerror or e}") from e
+    return {"format": fmt, "path": str(path), "count": len(all_tasks), "tasks": all_tasks}

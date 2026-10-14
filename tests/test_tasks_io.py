@@ -181,6 +181,29 @@ def test_edit_failing_editor_keeps_body(home, plain, run, tmp_path, monkeypatch)
     assert "status 3" in fail(run, plain, "edit", a)
 
 
+def test_edit_detects_concurrent_body_change(home, plain, run, tmp_path, monkeypatch):
+    a = mk(run, plain, "x")
+    script = tmp_path / "racy.py"
+    script.write_text(
+        "import subprocess, sys\n"
+        f"subprocess.run([{sys.executable!r}, '-m', 'docket', 'note', {a!r}, 'sneaky'],"
+        " check=True)\n"
+        "open(sys.argv[1], 'w', encoding='utf-8').write('mine')\n",
+        encoding="utf-8",
+    )
+    monkeypatch.delenv("VISUAL", raising=False)
+    monkeypatch.setenv("EDITOR", f'"{sys.executable}" "{script}"')
+    err = fail(run, plain, "edit", a)
+    assert "changed during the edit" in err
+    saved = err.strip().rsplit("Your edit is in ", 1)[1]
+    try:
+        with open(saved, encoding="utf-8") as f:
+            assert f.read() == "mine"
+    finally:
+        os.unlink(saved)
+    assert "sneaky" in js(run, plain, "show", a)["body"]
+
+
 def test_edit_removes_temp_file(home, plain, run, fake_editor, monkeypatch):
     import tempfile
 
