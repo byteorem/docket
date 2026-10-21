@@ -2,9 +2,13 @@
 
 from __future__ import annotations
 
+import os
 import re
 import secrets
+import shlex
+import shutil
 import string
+import subprocess
 from collections import defaultdict
 from collections.abc import Iterable, Iterator
 from contextlib import contextmanager
@@ -25,6 +29,7 @@ from docket.store import (
     discover,
     load_config,
     lock,
+    user_home,
 )
 
 CORE = ("id", "title", "status", "created", "closed_at", "deps")
@@ -612,6 +617,41 @@ def index(s: Snapshot, limit: int) -> dict[str, Any] | None:
         "blocked": blocked,
         "omitted": len(underway) + len(ready) - len(shown_underway) - len(shown_ready),
     }
+
+
+def open_in_editor(refs: Iterable[str]) -> dict[str, Any]:
+    """Open the task files, or the store folder without REFS, in the editor; wait for it."""
+    s = snapshot()
+    refs = list(refs)
+    if refs:
+        paths = [s.paths[i] for i in dict.fromkeys(s.resolve(r) for r in refs)]
+    else:
+        store = s.location.require()
+        if not store.is_dir():
+            raise DocketError(f"{store} does not exist yet; create a task first")
+        paths = [store]
+    editor = _editor(s.config)
+    files = [str(p) for p in paths]
+    code = subprocess.run([*editor, *files]).returncode
+    if code:
+        raise DocketError(f"editor exited with {code}: {editor[0]}")
+    return {"editor": editor, "paths": files}
+
+
+def _editor(config: Config) -> list[str]:
+    """The editor command from config, VISUAL, or EDITOR, with its program found on PATH."""
+    line = config.editor or os.environ.get("VISUAL") or os.environ.get("EDITOR")
+    if not line:
+        raise DocketError(f"no editor set; add 'editor: zed' to {user_home() / 'config.yaml'}")
+    if os.name == "nt":
+        # Windows paths keep their backslashes; drop the quotes around a spaced path.
+        argv = [a.removeprefix('"').removesuffix('"') for a in shlex.split(line, posix=False)]
+    else:
+        argv = shlex.split(line)
+    program = shutil.which(argv[0]) if argv else None
+    if program is None:
+        raise DocketError(f"editor not found: {line}")
+    return [program, *argv[1:]]
 
 
 def where(location: Location | None = None) -> dict[str, str | None]:

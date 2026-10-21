@@ -23,6 +23,7 @@ docket close a3f8.1
 |---|---|
 | `create "title" [--parent ID] [--dep ID] [--set K=V] [--file PATH]` | Create a task, or a subtask with `--parent`. Body from `--file` or stdin. `--dep` and `--set` repeat. |
 | `show ID` / `path ID` | Print the file plus Parent, Blockers, Blocking, Subtasks / print the file's path. |
+| `open [ID...]` | Open the task files, or the store folder, in the user's editor (`editor` in config, else `$VISUAL`, `$EDITOR`). For people; agents read files with `path`. |
 | `ls [--status S] [--where K=V] [--all] [--tree]` | Open tasks; `--all` adds closed. `--where` repeats and matches a string, or a list containing the value. |
 | `ready` / `blocked` | Same filters. Ready: open with every dep closed. Blocked: waiting on an open or missing dep. |
 | `set ID KEY VALUE` / `unset ID KEY` | Set `title`, `status`, or any user field / remove a user field. |

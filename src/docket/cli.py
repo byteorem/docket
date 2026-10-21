@@ -110,6 +110,12 @@ def cmd_path(args: argparse.Namespace) -> None:
     emit({"path": path}, path, args.json)
 
 
+def cmd_open(args: argparse.Namespace) -> None:
+    from docket import tasks
+
+    emit(tasks.open_in_editor(args.ids), "", args.json)
+
+
 def _list(args: argparse.Namespace, states: tuple[str, ...], tree: bool = False) -> None:
     from docket import tasks
 
@@ -339,6 +345,9 @@ def build_parser() -> argparse.ArgumentParser:
 
     p = command("path", cmd_path, "Print the task file's absolute path.")
     p.add_argument("id")
+
+    p = command("open", cmd_open, "Open task files, or the store folder, in your editor.")
+    p.add_argument("ids", metavar="ID", nargs="*")
 
     p = command("ls", cmd_ls, "List open tasks.")
     filters(p)

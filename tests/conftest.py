@@ -14,9 +14,10 @@ from docket import cli
 
 @pytest.fixture(autouse=True)
 def isolated(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
-    """Keep every test away from the real ~/.docket and any DOCKET_DIR in the shell."""
+    """Keep every test away from the real ~/.docket and the shell's DOCKET_DIR and editor."""
     monkeypatch.setenv("DOCKET_HOME", str(tmp_path / "docket-home"))
-    monkeypatch.delenv("DOCKET_DIR", raising=False)
+    for name in ("DOCKET_DIR", "VISUAL", "EDITOR"):
+        monkeypatch.delenv(name, raising=False)
     monkeypatch.chdir(tmp_path)
 
 

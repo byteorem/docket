@@ -24,7 +24,7 @@ docket close v4ek.1
 
 | Commands | |
 |---|---|
-| `create` `show` `path` | Create and read tasks |
+| `create` `show` `path` `open` | Create and read tasks; `open` launches your editor |
 | `ls` `ready` `blocked` | List by state, filtered with `--status` and `--where K=V` |
 | `set` `unset` `add` `remove` `note` | Change fields and append to the body |
 | `close` `reopen` `dep` `undep` | Status and dependencies |
@@ -60,4 +60,7 @@ Docket finds the store from the current folder, following a linked worktree's `.
 ```yaml
 default_status: open         # set by create and reopen
 closed_statuses: [closed]    # close sets the first; any other status is open
+editor: zed                  # used by open; default $VISUAL, then $EDITOR
 ```
+
+`docket open ID...` passes the task files to the editor, and `docket open` alone passes the store folder. The editor is a command line, so it can take flags (`editor: code --new-window`), and docket waits for it to exit.

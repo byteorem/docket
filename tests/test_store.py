@@ -111,6 +111,7 @@ def test_other_statuses_count_as_open(store, ok, mk):
         ("closed_statuses: []\n", "closed_statuses"),
         ("closed_statuses: done\n", "closed_statuses"),
         ("default_status: done\nclosed_statuses: [done]\n", "also in closed_statuses"),
+        ("editor: [zed]\n", "editor must be a one-line command"),
         ("defualt_status: todo\n", "unknown key 'defualt_status'"),
         ("[a, b]\n", "expected a mapping"),
         ("default_status: [\n", "invalid YAML"),

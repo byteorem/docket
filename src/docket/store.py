@@ -75,6 +75,7 @@ def _join(base: Path, path: str) -> Path:
 class Config:
     default_status: str = "open"
     closed_statuses: tuple[str, ...] = ("closed",)
+    editor: str | None = None
 
 
 def user_home() -> Path:
@@ -93,13 +94,16 @@ def load_config(store: Path | None) -> Config:
 
     default = merged.get("default_status", Config.default_status)
     closed = merged.get("closed_statuses", list(Config.closed_statuses))
-    if not _is_status(default):
+    if not _is_line(default):
         raise DocketError("config: default_status must be a one-line string")
-    if not isinstance(closed, list) or not closed or not all(_is_status(s) for s in closed):
+    if not isinstance(closed, list) or not closed or not all(_is_line(s) for s in closed):
         raise DocketError("config: closed_statuses must be a non-empty list of one-line strings")
     if default in closed:
         raise DocketError(f"config: default_status '{default}' is also in closed_statuses")
-    return Config(default_status=default, closed_statuses=tuple(closed))
+    editor = merged.get("editor")
+    if editor is not None and not _is_line(editor):
+        raise DocketError("config: editor must be a one-line command")
+    return Config(default_status=default, closed_statuses=tuple(closed), editor=editor)
 
 
 def _read_config(path: Path) -> dict[str, Any]:
@@ -116,12 +120,12 @@ def _read_config(path: Path) -> dict[str, Any]:
     if not isinstance(data, dict):
         raise DocketError(f"{path}: expected a mapping")
     for key in data:
-        if key not in ("default_status", "closed_statuses"):
+        if key not in ("default_status", "closed_statuses", "editor"):
             raise DocketError(f"{path}: unknown key '{key}'")
     return data
 
 
-def _is_status(value: object) -> bool:
+def _is_line(value: object) -> bool:
     return isinstance(value, str) and bool(value.strip()) and value.splitlines() == [value]
 
 
