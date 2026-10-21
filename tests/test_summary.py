@@ -63,6 +63,9 @@ def test_check_reports_every_kind(store, run, mk):
     (tasks / "e8f9.md").rename(tasks / "wxyz.md")
     (tasks / "bad1.md").write_text("---\ntitle: [unclosed\n---\n", encoding="utf-8")
     (tasks / "bad2.md").write_text('---\nid: "bad2"\ntitle: no status\n---\n', encoding="utf-8")
+    write_task(store, "f0a1")
+    with (tasks / "f0a1.md").open("ab") as f:
+        f.write(b"\nLatin-1 caf\xe9\n")
 
     result = run("check", "--json")
     assert result.code == 1
@@ -73,11 +76,13 @@ def test_check_reports_every_kind(store, run, mk):
         ("bad1.md", "invalid"),
         ("bad2.md", "invalid"),
         ("c6d7.1.md", "orphan"),
+        ("f0a1.md", "encoding"),
         ("wxyz.md", "id-mismatch"),
     }
     by_kind = {p["kind"]: p["message"] for p in problems}
     assert by_kind["cycle"] == "dependency cycle: a3f8 -> b4c5 -> a3f8"
     assert by_kind["missing-dep"] == "b4c5 depends on missing task gone"
+    assert by_kind["encoding"].startswith("f0a1 is not valid UTF-8 on line ")
 
     text = run("check")
     assert text.code == 1

@@ -13,6 +13,12 @@ def check(s: Snapshot) -> dict[str, Any]:
     for stem, error in s.invalid.items():
         found.append((stem, error.kind, str(error)))
     for task in s.graph.tasks.values():
+        raw = task.path.read_bytes()
+        try:
+            raw.decode("utf-8")
+        except UnicodeDecodeError as e:
+            line = raw[: e.start].count(b"\n") + 1
+            found.append((task.id, "encoding", f"{task.id} is not valid UTF-8 on line {line}"))
         if task.parent is not None and task.parent not in s.paths:
             found.append((task.id, "orphan", f"{task.id} has no parent {task.parent}"))
         for dep in task.deps:
