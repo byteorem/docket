@@ -15,7 +15,7 @@ from contextlib import contextmanager
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from pathlib import Path
-from typing import Any
+from typing import Any, Literal
 
 import yaml
 
@@ -491,14 +491,125 @@ def note(ref: str, text: str) -> dict[str, Any]:
     text = text.rstrip()
     if not text:
         raise DocketError("note text is empty")
+    return edit_body(ref, "append", f"**{now()}** {text}", section=NOTES)
+
+
+# --- body ---
+
+BodyMode = Literal["set", "append", "replace"]
+NOTES = "Notes"
+HEADING_RE = re.compile(r" {0,3}(#{1,6})[ \t]+(.*?)(?:[ \t]+#+)?[ \t]*")
+FENCE_RE = re.compile(r" {0,3}(`{3,}|~{3,})")
+
+
+def edit_body(
+    ref: str, mode: BodyMode, text: str, *, old: str = "", section: str | None = None
+) -> dict[str, Any]:
+    """Replace, append to, or swap one exact match in the body, or in the section SECTION."""
+    text = text.replace("\r\n", "\n")
+    if mode == "replace":
+        old = old.replace("\r\n", "\n")
+        if not old:
+            raise DocketError("text to replace is empty")
+    else:
+        text = text.strip("\n")
+        if not text.strip():
+            raise DocketError("body text is empty")
+    if section is not None:
+        section = section.strip().lstrip("#").strip()
+        _check_line("section", section)
     with writing() as s:
         task = s.get(ref)
-        _, body = read_file(task.path)
-        if body and not body.endswith(b"\n"):
-            body += b"\n"
-        body += f"\n**{now()}** {text}\n".encode()
-        atomic_write(task.path, dump(task.meta) + body)
+        raw = task.path.read_bytes()
+        _, current = split(raw)
+        doc = current.decode("utf-8")
+        nl = "\r\n" if "\r\n" in doc else "\n"
+        text, old = text.replace("\n", nl), old.replace("\n", nl)
+        if section is None:
+            doc = _edit_scope(doc, mode, text, old, nl, f"the body of {task.id}")
+        else:
+            first_line = raw[: len(raw) - len(current)].count(b"\n") + 1
+            doc = _edit_section(doc, mode, text, old, nl, section, task.id, first_line)
+        atomic_write(task.path, dump(task.meta) + doc.encode("utf-8"))
         return s.object(task)
+
+
+def _edit_scope(scope: str, mode: BodyMode, text: str, old: str, nl: str, label: str) -> str:
+    """SCOPE, the whole body, after the edit."""
+    if mode == "set":
+        return nl + text + nl
+    if mode == "append":
+        if scope and not scope.endswith("\n"):
+            scope += nl
+        return scope + nl + text + nl
+    return _swap(scope, old, text, label)
+
+
+def _edit_section(
+    doc: str,
+    mode: BodyMode,
+    text: str,
+    old: str,
+    nl: str,
+    name: str,
+    task_id: str,
+    first_line: int,
+) -> str:
+    lines = [line for line in re.split(r"(?<=\n)", doc) if line]
+    headings = _headings(lines)
+    found = [(i, level) for i, level, title in headings if title.casefold() == name.casefold()]
+    label = f"section '{name}' of {task_id}"
+    if len(found) > 1:
+        at = ", ".join(str(first_line + i) for i, _ in found)
+        raise DocketError(f"{label} appears {len(found)} times (lines {at}); rename one")
+    if not found:
+        if mode == "replace":
+            raise DocketError(f"no {label}")
+        return _edit_scope(doc, "append", f"## {name}{nl}{nl}{text}", "", nl, label)
+    start, level = found[0]
+    end = next((i for i, lv, _ in headings if i > start and lv <= level), len(lines))
+    head = "".join(lines[: start + 1])
+    if not head.endswith("\n"):
+        head += nl
+    content, tail = "".join(lines[start + 1 : end]), "".join(lines[end:])
+    gap = nl if tail else ""
+    if mode == "set":
+        content = nl + text + nl + gap
+    elif mode == "append":
+        kept = content.rstrip() + nl if content.strip() else ""
+        content = kept + nl + text + nl + gap
+    else:
+        content = _swap(content, old, text, label)
+    return head + content + tail
+
+
+def _swap(scope: str, old: str, new: str, label: str) -> str:
+    count = scope.count(old)
+    if count == 0:
+        raise DocketError(f"text to replace not found in {label}")
+    if count > 1:
+        raise DocketError(
+            f"text to replace appears {count} times in {label}; include more surrounding text"
+        )
+    return scope.replace(old, new, 1)
+
+
+def _headings(lines: list[str]) -> list[tuple[int, int, str]]:
+    """Line index, level, and text of each ATX heading outside fenced code."""
+    found = []
+    fence: str | None = None
+    for i, line in enumerate(lines):
+        line = line.rstrip("\r\n")
+        m = FENCE_RE.match(line)
+        if fence is not None:
+            marker = m.group(1) if m else ""
+            if marker[:1] == fence[0] and len(marker) >= len(fence) and not line[m.end() :].strip():
+                fence = None
+        elif m:
+            fence = m.group(1)
+        elif heading := HEADING_RE.fullmatch(line):
+            found.append((i, len(heading.group(1)), heading.group(2)))
+    return found
 
 
 # --- read commands ---

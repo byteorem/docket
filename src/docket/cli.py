@@ -193,6 +193,20 @@ def cmd_note(args: argparse.Namespace) -> None:
     _written("noted", tasks.note(args.id, text), args.json)
 
 
+def cmd_body(args: argparse.Namespace) -> None:
+    from docket import tasks
+
+    old = ""
+    if args.append is not None:
+        mode, text = "append", args.append
+    elif args.replace is not None:
+        mode, (old, text) = "replace", args.replace
+    else:
+        mode, text = "set", _read_text(args.file) if args.file else _read_stdin()
+    task = tasks.edit_body(args.id, mode, text, old=old, section=args.section)
+    _written("updated", task, args.json)
+
+
 def cmd_where(args: argparse.Namespace) -> None:
     from docket import tasks
 
@@ -399,6 +413,16 @@ def build_parser() -> argparse.ArgumentParser:
     p = command("note", cmd_note, "Append a timestamped note to the body; text from stdin.")
     p.add_argument("id")
     p.add_argument("text", nargs="?")
+
+    p = command("body", cmd_body, "Replace the body, append to it, or swap one exact match.")
+    p.add_argument("id")
+    p.add_argument("--section", metavar="NAME", help="work inside the section under heading NAME")
+    edit = p.add_mutually_exclusive_group()
+    edit.add_argument("--file", metavar="PATH", help="replace with the text in PATH, not stdin")
+    edit.add_argument("--append", metavar="TEXT", help="add TEXT at the end")
+    edit.add_argument(
+        "--replace", nargs=2, metavar=("OLD", "NEW"), help="swap the one exact match of OLD"
+    )
 
     command("where", cmd_where, "Print the store path, git directory, and worktree root.")
 

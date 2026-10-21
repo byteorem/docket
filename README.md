@@ -19,6 +19,7 @@ docket create "Add CSV export endpoint" --set branch=feat/csv   # created v4ek
 docket create "Stream rows" --parent v4ek                       # created v4ek.1
 docket set v4ek.1 status in_progress
 docket note v4ek.1 "Pagination still TODO"
+docket body v4ek.1 --section Plan --append "- [ ] paginate"
 docket close v4ek.1
 ```
 
@@ -26,7 +27,8 @@ docket close v4ek.1
 |---|---|
 | `create` `show` `path` `open` | Create and read tasks; `open` launches your editor |
 | `ls` `ready` `blocked` | List by state, filtered with `--status` and `--where K=V` |
-| `set` `unset` `add` `remove` `note` | Change fields and append to the body |
+| `set` `unset` `add` `remove` | Change fields |
+| `note` `body` | Log a timestamped note under `## Notes`, or edit the body or one `## Section` of it |
 | `close` `reopen` `dep` `undep` | Status and dependencies |
 | `where` `index` `check` `help` | Store location, session summary, problems, usage |
 | `install` | Agent setup |

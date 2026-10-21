@@ -13,6 +13,7 @@ Each repo keeps its tasks as Markdown files in `.git/docket/tasks/`, shared by e
 docket ready                                   # what can be worked on now
 docket set a3f8.1 status in_progress
 docket note a3f8.1 "Endpoint streams; pagination still TODO"
+docket body a3f8.1 --section Plan --append "- [ ] paginate"
 docket create "Fix CSV quoting" --file plan.md --set found_in=a3f8.1
 docket close a3f8.1
 ```
@@ -30,7 +31,8 @@ docket close a3f8.1
 | `add ID KEY VALUE` / `remove ID KEY VALUE` | Edit a list user field. |
 | `close ID [--status S] [--force]` / `reopen ID [--force]` | Close with the first closed status (or `S`) / return to the default status. |
 | `dep ID DEP_ID` / `undep ID DEP_ID` | ID waits on DEP_ID / stop waiting. |
-| `note ID ["text"]` | Append `**<timestamp>** text` to the body; text from stdin if omitted. This is how an agent adds to a body. |
+| `note ID ["text"]` | Log what happened: append `**<timestamp>** text` under `## Notes`, adding the heading at the end if missing. Text from stdin if omitted. |
+| `body ID [--section NAME] [--file PATH \| --append TEXT \| --replace OLD NEW]` | Edit the description and plan: replace the body (from `--file` or stdin), append to it, or swap the one exact match of OLD for NEW. With `--section`, work inside that section; replace and append add a missing one as `## NAME` at the end. The text can't be empty, so a body or section can be rewritten but not cleared. |
 | `index [--limit N]` | Session summary: underway tasks, ready tasks, blocked count. |
 | `where`, `check`, `help` | Store location; report broken files, missing deps, cycles; usage. |
 | `install skill [--dir DIR]` / `install hook` | Write this skill to `~/.claude/skills/docket/` / add the SessionStart hook and permission rules to Claude Code settings. |
@@ -41,12 +43,14 @@ docket close a3f8.1
 - **Status** is any string. Only statuses in `closed_statuses` (default `[closed]`) count as closed; `in_progress`, `review`, and the like are all open. New and reopened tasks get `default_status` (default `open`).
 - **Fields**: `id`, `title`, `status`, `created`, `closed_at`, and `deps` are core. Every other key is yours, and `set` stores it as a string. Docket gives user fields no meaning.
 - **Subtasks**: need an open parent. A task can't close with open subtasks, and a subtask can't reopen under a closed parent, unless you pass `--force`. Open subtasks don't affect the parent's state.
+- **Sections** are Markdown headings you write (`## Plan`); docket gives them no meaning beyond `note` writing to `## Notes`. `--section` matches the heading text ignoring case and any leading `#`s and covers everything up to the next heading at the same or a higher level, so subheadings stay inside. Headings in code fences don't count, and a name used twice is an error.
 - **Deps**: `dep` rejects self-dependencies, unknown IDs, and cycles. A dep on a closed task stays in the file but no longer blocks.
 
 ## Gotchas
 
 - `ready` includes parents whose subtasks are still open. Check `show` before starting a parent.
 - `set ID status closed` follows the same subtask rules as `close`, but has no `--force`; use `close --force`.
-- `create` and `note` read stdin whenever it is piped and wait for EOF, so a shell that leaves a pipe open hangs them. Pass the body with `--file`, or the note text as an argument.
+- `create`, `note`, and `body` without a flag read stdin whenever it is piped and wait for EOF, so a shell that leaves a pipe open hangs them. Pass the body with `--file`, or the note text as an argument.
+- `body --replace` fails when OLD matches zero times or more than once; add surrounding text to OLD until it is unique. For large rewrites, replace the section with `--file`.
 - Write multi-line bodies to a file for `--file`. Quoted arguments keep literal newlines, but `\n` stays two characters.
 - Outside a git repo, reads show nothing and writes fail; set `DOCKET_DIR` to use a folder instead.

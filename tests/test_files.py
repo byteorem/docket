@@ -178,20 +178,140 @@ def test_create_set_without_equals_is_a_usage_error(store, run):
     assert result.code == 2 and result.stdout == ""
 
 
-def test_note_appends_timestamped_text(store, ok, mk):
+def test_note_appends_timestamped_text_under_notes(store, ok, mk):
     task_id = mk("Task", stdin="Body")
     ok("note", task_id, "First")
     ok("note", task_id, stdin="From stdin\nsecond line\n")
     text = task_file(store, task_id).read_text()
     assert re.fullmatch(
-        f"(?s)---\n.*---\n\nBody\n\n\\*\\*{TS}\\*\\* First\n\n"
+        f"(?s)---\n.*---\n\nBody\n\n## Notes\n\n\\*\\*{TS}\\*\\* First\n\n"
         f"\\*\\*{TS}\\*\\* From stdin\nsecond line\n",
         text,
     )
 
 
+def test_note_stays_out_of_the_last_section(store, ok, mk, tmp_path):
+    task_id = mk("Task", stdin="## Plan\n\n- step")
+    ok("note", task_id, "logged")
+    plan = tmp_path / "plan.md"
+    plan.write_text("- new step\n", encoding="utf-8")
+    ok("body", task_id, "--section", "Plan", "--file", str(plan))
+    assert re.fullmatch(
+        f"\n## Plan\n\n- new step\n\n## Notes\n\n\\*\\*{TS}\\*\\* logged\n", body_of(store, task_id)
+    )
+
+
+def test_note_reuses_an_existing_notes_section(store, ok, mk):
+    task_id = mk("Task", stdin="## notes\n\nby hand\n\n## Plan\n\n- step")
+    ok("note", task_id, "logged")
+    assert re.fullmatch(
+        f"\n## notes\n\nby hand\n\n\\*\\*{TS}\\*\\* logged\n\n## Plan\n\n- step\n",
+        body_of(store, task_id),
+    )
+
+
 def test_note_needs_text(store, fail, mk):
     assert "empty" in fail("note", mk("Task"), "  ")
+
+
+def body_of(store: Path, task_id: str) -> str:
+    return task_file(store, task_id).read_text().split("---\n", 2)[2]
+
+
+def test_body_replaces_appends_and_swaps(store, ok, mk, tmp_path):
+    task_id = mk("Task", stdin="Old body")
+    head = task_file(store, task_id).read_bytes().partition(b"---\n\n")[0]
+    ok("body", task_id, stdin="New body\n\n")
+    assert body_of(store, task_id) == "\nNew body\n"
+    ok("body", task_id, "--append", "More")
+    assert body_of(store, task_id) == "\nNew body\n\nMore\n"
+    ok("body", task_id, "--replace", "New body", "Fresh body")
+    assert body_of(store, task_id) == "\nFresh body\n\nMore\n"
+    plan = tmp_path / "plan.md"
+    plan.write_text("From file\n", encoding="utf-8")
+    ok("body", task_id, "--file", str(plan))
+    assert body_of(store, task_id) == "\nFrom file\n"
+    assert task_file(store, task_id).read_bytes().startswith(head)
+
+
+def test_body_replace_needs_exactly_one_match(store, ok, fail, mk):
+    task_id = mk("Task", stdin="a b a")
+    assert "2 times" in fail("body", task_id, "--replace", "a", "c")
+    assert "not found" in fail("body", task_id, "--replace", "z", "c")
+    ok("body", task_id, "--replace", " b", "")
+    assert body_of(store, task_id) == "\na a\n"
+
+
+SECTIONED = """\
+Intro
+
+## Plan
+
+- old step
+
+### Detail
+
+deep
+
+## Notes
+
+note
+"""
+
+
+def test_body_sections(store, ok, mk):
+    task_id = mk("Task", stdin=SECTIONED)
+    ok("body", task_id, "--section", "plan", "--append", "- new step")
+    ok("body", task_id, "--section", "Detail", "--replace", "deep", "deeper")
+    ok("body", task_id, "--section", "Notes", stdin="replaced")
+    assert body_of(store, task_id) == (
+        "\nIntro\n\n## Plan\n\n- old step\n\n### Detail\n\ndeeper\n\n- new step\n\n"
+        "## Notes\n\nreplaced\n"
+    )
+
+
+def test_body_section_name_may_include_the_heading_marks(store, ok, mk):
+    task_id = mk("Task", stdin="## Plan\n\n- step")
+    ok("body", task_id, "--section", "## Plan", "--append", "- next")
+    assert body_of(store, task_id) == "\n## Plan\n\n- step\n\n- next\n"
+
+
+def test_body_adds_a_missing_section_but_replace_needs_it(store, ok, fail, mk):
+    task_id = mk("Task", stdin="Intro")
+    assert "no section 'Plan'" in fail("body", task_id, "--section", "Plan", "--replace", "a", "b")
+    ok("body", task_id, "--section", "Plan", "--append", "- step")
+    assert body_of(store, task_id) == "\nIntro\n\n## Plan\n\n- step\n"
+
+
+def test_body_section_skips_headings_in_code_fences(store, ok, mk):
+    task_id = mk("Task", stdin="## Plan\n\n````md\n## Notes\n```\n````\n")
+    ok("body", task_id, "--section", "Notes", "--append", "real")
+    ok("body", task_id, "--section", "Plan", "--append", "step")
+    assert body_of(store, task_id) == (
+        "\n## Plan\n\n````md\n## Notes\n```\n````\n\nstep\n\n## Notes\n\nreal\n"
+    )
+
+
+def test_body_rejects_duplicate_sections(store, fail, mk):
+    task_id = mk("Task", stdin="## Plan\n\na\n\n## plan ##\n\nb")
+    message = fail("body", task_id, "--section", "Plan", "--append", "x")
+    assert "appears 2 times (lines 8, 12)" in message
+
+
+def test_body_keeps_crlf_line_endings(store, ok, mk):
+    task_id = mk("Task")
+    path = task_file(store, task_id)
+    path.write_bytes(path.read_bytes() + b"\r\n## Plan\r\n\r\nold\r\n")
+    ok("body", task_id, "--section", "Plan", "--append", "one\ntwo")
+    assert path.read_bytes().endswith(b"\r\n## Plan\r\n\r\nold\r\n\r\none\r\ntwo\r\n")
+
+
+def test_body_rejects_empty_text_and_mixed_modes(store, run, fail, mk):
+    task_id = mk("Task", stdin="Body")
+    assert "empty" in fail("body", task_id)
+    assert "empty" in fail("body", task_id, "--replace", "", "x")
+    result = run("body", task_id, "--append", "x", "--replace", "a", "b", "--json")
+    assert result.code == 2 and result.stdout == ""
 
 
 def test_show_text_prints_the_file_then_sections(store, run, mk):
