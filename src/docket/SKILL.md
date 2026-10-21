@@ -5,7 +5,7 @@ description: Local task tracker CLI. Use when the user mentions Docket or one of
 
 # Docket
 
-Each repo keeps its tasks as Markdown files in `.git/docket/tasks/`, shared by every worktree. Change tasks through the `docket` CLI, which enforces the rules below; reading a file directly (`docket path ID`) is fine. Add `--json` to any command for one JSON value (stdout stays empty on error). Exit 1 is a command error with a one-line message on stderr; exit 2 is a usage error.
+Each repo keeps its tasks as Markdown files in `.git/docket/tasks/`, shared by every worktree. Change tasks through the `docket` CLI, which enforces the rules below; reading a file directly (`docket path ID`) is fine, and editing one is the fallback (see Editing by hand). Add `--json` to any command for one JSON value (stdout stays empty on error). Exit 1 is a command error with a one-line message on stderr; exit 2 is a usage error.
 
 ## Typical session
 
@@ -45,6 +45,14 @@ docket close a3f8.1
 - **Subtasks**: need an open parent. A task can't close with open subtasks, and a subtask can't reopen under a closed parent, unless you pass `--force`. Open subtasks don't affect the parent's state.
 - **Sections** are Markdown headings you write (`## Plan`); docket gives them no meaning beyond `note` writing to `## Notes`. `--section` matches the heading text ignoring case and any leading `#`s and covers everything up to the next heading at the same or a higher level, so subheadings stay inside. Headings in code fences don't count, and a name used twice is an error.
 - **Deps**: `dep` rejects self-dependencies, unknown IDs, and cycles. A dep on a closed task stays in the file but no longer blocks.
+
+## Editing by hand
+
+When no command makes the change, such as a non-string or nested field, a body rework too large for `body --replace`, or a file `docket check` reports as broken, edit the file at `docket path ID` directly. Keep what the CLI would have enforced:
+
+- Change `status` and `deps` with `set`, `close`, `reopen`, `dep`, and `undep`, so closing dates, subtask rules, and cycle checks still apply. Leave `id`, `created`, and `closed_at` as written.
+- Keep the frontmatter a YAML mapping between `---` lines, IDs double-quoted, and the file UTF-8 named after its `id`. New tasks come from `create`, which picks the ID.
+- Run `docket check` afterwards; it reports broken files, missing deps, and cycles.
 
 ## Gotchas
 
