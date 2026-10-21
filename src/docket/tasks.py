@@ -516,22 +516,44 @@ def edit_body(
         if not text.strip():
             raise DocketError("body text is empty")
     if section is not None:
-        section = section.strip().lstrip("#").strip()
-        _check_line("section", section)
+        section = _section_name(section)
     with writing() as s:
         task = s.get(ref)
-        raw = task.path.read_bytes()
-        _, current = split(raw)
-        doc = current.decode("utf-8")
+        doc, first_line = _read_body(task)
         nl = "\r\n" if "\r\n" in doc else "\n"
         text, old = text.replace("\n", nl), old.replace("\n", nl)
         if section is None:
             doc = _edit_scope(doc, mode, text, old, nl, f"the body of {task.id}")
         else:
-            first_line = raw[: len(raw) - len(current)].count(b"\n") + 1
             doc = _edit_section(doc, mode, text, old, nl, section, task.id, first_line)
         atomic_write(task.path, dump(task.meta) + doc.encode("utf-8"))
         return s.object(task)
+
+
+def decode(path: Path, raw: bytes) -> str:
+    """RAW as text; a task file that isn't UTF-8 is for the user to fix."""
+    try:
+        return raw.decode("utf-8")
+    except UnicodeDecodeError as e:
+        line = raw[: e.start].count(b"\n") + 1
+        raise DocketError(
+            f"{path}: not valid UTF-8 on line {line}; fix it by hand (see docket check)"
+        ) from None
+
+
+def _read_body(task: Task) -> tuple[str, int]:
+    """The body as text, and the file line it starts on."""
+    raw = task.path.read_bytes()
+    decode(task.path, raw)
+    _, body = split(raw)
+    return body.decode("utf-8"), raw[: len(raw) - len(body)].count(b"\n") + 1
+
+
+def _section_name(name: str) -> str:
+    """NAME without the heading marks an agent may copy along with it."""
+    name = name.strip().lstrip("#").strip()
+    _check_line("section", name)
+    return name
 
 
 def _edit_scope(scope: str, mode: BodyMode, text: str, old: str, nl: str, label: str) -> str:
@@ -555,19 +577,14 @@ def _edit_section(
     task_id: str,
     first_line: int,
 ) -> str:
-    lines = [line for line in re.split(r"(?<=\n)", doc) if line]
-    headings = _headings(lines)
-    found = [(i, level) for i, level, title in headings if title.casefold() == name.casefold()]
+    lines = _lines(doc)
     label = f"section '{name}' of {task_id}"
-    if len(found) > 1:
-        at = ", ".join(str(first_line + i) for i, _ in found)
-        raise DocketError(f"{label} appears {len(found)} times (lines {at}); rename one")
-    if not found:
+    span = _find_section(lines, name, label, first_line)
+    if span is None:
         if mode == "replace":
             raise DocketError(f"no {label}")
         return _edit_scope(doc, "append", f"## {name}{nl}{nl}{text}", "", nl, label)
-    start, level = found[0]
-    end = next((i for i, lv, _ in headings if i > start and lv <= level), len(lines))
+    start, end = span
     head = "".join(lines[: start + 1])
     if not head.endswith("\n"):
         head += nl
@@ -592,6 +609,26 @@ def _swap(scope: str, old: str, new: str, label: str) -> str:
             f"text to replace appears {count} times in {label}; include more surrounding text"
         )
     return scope.replace(old, new, 1)
+
+
+def _lines(doc: str) -> list[str]:
+    return [line for line in re.split(r"(?<=\n)", doc) if line]
+
+
+def _find_section(
+    lines: list[str], name: str, label: str, first_line: int
+) -> tuple[int, int] | None:
+    """Index of the heading NAME and of the line that ends its section, or None."""
+    headings = _headings(lines)
+    found = [(i, level) for i, level, title in headings if title.casefold() == name.casefold()]
+    if len(found) > 1:
+        at = ", ".join(str(first_line + i) for i, _ in found)
+        raise DocketError(f"{label} appears {len(found)} times (lines {at}); rename one")
+    if not found:
+        return None
+    start, level = found[0]
+    end = next((i for i, lv, _ in headings if i > start and lv <= level), len(lines))
+    return start, end
 
 
 def _headings(lines: list[str]) -> list[tuple[int, int, str]]:
@@ -619,6 +656,7 @@ def show(s: Snapshot, ref: str) -> dict[str, Any]:
     """The task object with body and relations, the file text, and a summary per related ID."""
     task = s.get(ref)
     raw = task.path.read_bytes()
+    text = decode(task.path, raw)
     _, body = split(raw)
     blockers = s.graph.blockers(task)
     blocking = s.graph.blocking(task)
@@ -632,9 +670,23 @@ def show(s: Snapshot, ref: str) -> dict[str, Any]:
             blocking=blocking,
             subtasks=subtasks,
         ),
-        "file": raw.removeprefix(BOM).decode("utf-8").replace("\r\n", "\n"),
+        "file": text.removeprefix("﻿").replace("\r\n", "\n"),
         "related": {i: s.object(s.graph.tasks[i]) if i in s.graph.tasks else None for i in related},
     }
+
+
+def show_section(s: Snapshot, ref: str, name: str) -> dict[str, Any]:
+    """The text under the heading NAME, without the heading."""
+    name = _section_name(name)
+    task = s.get(ref)
+    doc, first_line = _read_body(task)
+    lines = _lines(doc.replace("\r\n", "\n"))
+    label = f"section '{name}' of {task.id}"
+    span = _find_section(lines, name, label, first_line)
+    if span is None:
+        raise DocketError(f"no {label}")
+    start, end = span
+    return {"id": task.id, "section": name, "text": "".join(lines[start + 1 : end]).strip("\n")}
 
 
 def matches(value: Any, wanted: str) -> bool:

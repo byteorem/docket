@@ -79,6 +79,10 @@ def cmd_create(args: argparse.Namespace) -> None:
 def cmd_show(args: argparse.Namespace) -> None:
     from docket import tasks
 
+    if args.section is not None:
+        section = tasks.show_section(tasks.snapshot(), args.id, args.section)
+        emit(section, section["text"], args.json)
+        return
     data = tasks.show(tasks.snapshot(), args.id)
 
     def text() -> str:
@@ -356,6 +360,7 @@ def build_parser() -> argparse.ArgumentParser:
 
     p = command("show", cmd_show, "Print the task file, then parent, blockers, and subtasks.")
     p.add_argument("id")
+    p.add_argument("--section", metavar="NAME", help="print only the text under heading NAME")
 
     p = command("path", cmd_path, "Print the task file's absolute path.")
     p.add_argument("id")

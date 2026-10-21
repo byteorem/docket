@@ -306,6 +306,29 @@ def test_body_keeps_crlf_line_endings(store, ok, mk):
     assert path.read_bytes().endswith(b"\r\n## Plan\r\n\r\nold\r\n\r\none\r\ntwo\r\n")
 
 
+def test_show_section_prints_only_that_section(store, ok, run, fail, mk):
+    task_id = mk("Task", stdin=SECTIONED)
+    assert ok("show", task_id, "--section", "## plan") == {
+        "id": task_id,
+        "section": "plan",
+        "text": "- old step\n\n### Detail\n\ndeep",
+    }
+    assert run("show", task_id, "--section", "Notes").stdout == "note\n"
+    assert "no section 'Missing'" in fail("show", task_id, "--section", "Missing")
+
+
+@pytest.mark.parametrize(
+    "args", [("show",), ("show", "--section", "Plan"), ("body", "--append", "x")]
+)
+def test_body_that_is_not_utf8_is_a_one_line_error(store, fail, mk, args):
+    task_id = mk("Task", stdin="## Plan\n\nstep")
+    path = task_file(store, task_id)
+    path.write_bytes(path.read_bytes() + b"caf\xe9\n")
+    before = path.read_bytes()
+    assert "not valid UTF-8 on line 11" in fail(args[0], task_id, *args[1:])
+    assert path.read_bytes() == before
+
+
 def test_body_rejects_empty_text_and_mixed_modes(store, run, fail, mk):
     task_id = mk("Task", stdin="Body")
     assert "empty" in fail("body", task_id)

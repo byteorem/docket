@@ -23,7 +23,7 @@ docket close a3f8.1
 | Command | Behavior |
 |---|---|
 | `create "title" [--parent ID] [--dep ID] [--set K=V] [--file PATH]` | Create a task, or a subtask with `--parent`. Body from `--file` or stdin. `--dep` and `--set` repeat. |
-| `show ID` / `path ID` | Print the file plus Parent, Blockers, Blocking, Subtasks / print the file's path. |
+| `show ID [--section NAME]` / `path ID` | Print the file plus Parent, Blockers, Blocking, Subtasks, or with `--section` only the text under that heading / print the file's path. |
 | `open [ID...]` | Open the task files, or the store folder, in the user's editor (`editor` in config, else `$VISUAL`, `$EDITOR`). For people; agents read files with `path`. When the user asks to open their tasks without naming one, run `open` with no IDs rather than listing them. |
 | `ls [--status S] [--where K=V] [--all] [--tree]` | Open tasks; `--all` adds closed. `--where` repeats and matches a string, or a list containing the value. |
 | `ready` / `blocked` | Same filters. Ready: open with every dep closed. Blocked: waiting on an open or missing dep. |
@@ -34,7 +34,7 @@ docket close a3f8.1
 | `note ID ["text"]` | Log what happened: append `**<timestamp>** text` under `## Notes`, adding the heading at the end if missing. Text from stdin if omitted. |
 | `body ID [--section NAME] [--file PATH \| --append TEXT \| --replace OLD NEW]` | Edit the description and plan: replace the body (from `--file` or stdin), append to it, or swap the one exact match of OLD for NEW. With `--section`, work inside that section; replace and append add a missing one as `## NAME` at the end. The text can't be empty, so a body or section can be rewritten but not cleared. |
 | `index [--limit N]` | Session summary: underway tasks, ready tasks, blocked count. |
-| `where`, `check`, `help` | Store location; report broken files, missing deps, cycles; usage. |
+| `where`, `check`, `help` | Store location; report broken or non-UTF-8 files, missing deps, cycles; usage. |
 | `install skill [--dir DIR]` / `install hook` | Write this skill to `~/.claude/skills/docket/` / add the SessionStart hook and permission rules to Claude Code settings. |
 
 ## Rules
