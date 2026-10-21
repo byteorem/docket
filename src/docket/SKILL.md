@@ -35,7 +35,7 @@ docket close a3f8.1
 | `body ID [--section NAME] [--file PATH \| --append TEXT \| --replace OLD NEW]` | Edit the description and plan: replace the body (from `--file` or stdin), append to it, or swap the one exact match of OLD for NEW. With `--section`, work inside that section; replace and append add a missing one as `## NAME` at the end. The text can't be empty, so a body or section can be rewritten but not cleared. |
 | `index [--limit N]` | Session summary: underway tasks, ready tasks, blocked count. |
 | `where`, `check`, `help` | Store location; report broken or non-UTF-8 files, missing deps, cycles; usage. |
-| `install skill [--dir DIR]` / `install hook` | Write this skill to `~/.claude/skills/docket/` / add the SessionStart hook and permission rules to Claude Code settings. |
+| `install skill [--dir DIR]` / `install hook` | Write this skill to `DIR/docket/`, by default in Claude Code's skills folder / add the SessionStart hook and permission rules to Claude Code settings. |
 
 ## Rules
 
