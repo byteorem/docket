@@ -51,7 +51,7 @@ docket install hook
 ```
 <repo>/.git/docket/
 ├── config.yaml     optional
-├── .lock           held during a write
+├── .lock           locked during a write
 └── tasks/<id>.md
 ```
 

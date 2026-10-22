@@ -1,13 +1,12 @@
 import os
 import subprocess
 import sys
-import time
 from pathlib import Path
 
 import pytest
 from conftest import git
 
-from docket.store import atomic_write
+from docket.store import atomic_write, lock
 
 
 def test_where_in_main_worktree(git_repo, ok):
@@ -64,7 +63,6 @@ def test_reads_do_not_create_the_store(git_repo, ok, mk):
     assert not (repo / ".git" / "docket").exists()
     mk("First", cwd=repo)
     assert (repo / ".git" / "docket" / "tasks").is_dir()
-    assert not (repo / ".git" / "docket" / ".lock").exists()
 
 
 def test_git_never_sees_the_store(git_repo, mk):
@@ -125,21 +123,28 @@ def test_invalid_config_is_a_command_error(store, fail, text, message):
 # --- lock and writes ---
 
 
-def test_stale_lock_is_removed(store, mk):
-    lock = store / ".lock"
-    write(lock, "123")
-    old = time.time() - 120
-    os.utime(lock, (old, old))
-    mk("After a crash")
-    assert not lock.exists()
-
-
-def test_fresh_lock_times_out(store, fail, monkeypatch):
-    monkeypatch.setattr("docket.store.LOCK_TIMEOUT", 0.2)
+def test_lock_file_left_by_a_crash_does_not_block(store, mk):
     write(store / ".lock", "123")
-    assert "locked" in fail("create", "Blocked")
-    assert (store / ".lock").exists()
+    mk("After a crash")
+
+
+def test_held_lock_times_out(store, fail, monkeypatch):
+    monkeypatch.setattr("docket.store.LOCK_TIMEOUT", 0.2)
+    with lock(store):
+        assert "locked" in fail("create", "Blocked")
     assert list((store / "tasks").glob("*.md")) == []
+
+
+def test_lock_is_released_when_the_holder_dies(store, mk):
+    script = (
+        "import os, sys\n"
+        "from pathlib import Path\n"
+        "from docket.store import lock\n"
+        "with lock(Path(sys.argv[1])):\n"
+        "    os._exit(0)\n"
+    )
+    subprocess.run([sys.executable, "-c", script, str(store)], check=True, timeout=30)
+    mk("After the holder died")
 
 
 def test_replace_retries_on_permission_error(tmp_path, monkeypatch):

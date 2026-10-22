@@ -6,13 +6,12 @@ import os
 import tempfile
 import time
 from collections.abc import Iterator
-from contextlib import contextmanager, suppress
+from contextlib import contextmanager
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
 LOCK_TIMEOUT = 10.0
-LOCK_STALE = 60.0
 REPLACE_RETRIES = 5
 
 NO_STORE = "not in a git repo; run docket inside one, or set DOCKET_DIR to a folder"
@@ -134,39 +133,48 @@ def _is_line(value: object) -> bool:
 
 @contextmanager
 def lock(store: Path) -> Iterator[None]:
-    """Hold the store's write lock, creating the store folders on first write."""
+    """Hold the store's write lock, creating the store folders on first write.
+
+    The lock is an OS lock on .lock, so the OS releases it when a writer dies and
+    there is never a stale lock to clear. The file itself stays.
+    """
     (store / "tasks").mkdir(parents=True, exist_ok=True)
-    path = store / ".lock"
-    deadline = time.monotonic() + LOCK_TIMEOUT
-    while True:
-        try:
-            fd = os.open(path, os.O_CREAT | os.O_EXCL | os.O_WRONLY)
-            break
-        except (FileExistsError, PermissionError):
-            # Windows raises PermissionError while another process is deleting the lock.
-            if _is_stale(path):
-                with suppress(OSError):
-                    path.unlink()
-                continue
+    fd = os.open(store / ".lock", os.O_RDWR | os.O_CREAT)
+    try:
+        deadline = time.monotonic() + LOCK_TIMEOUT
+        while not _try_lock(fd):
             if time.monotonic() >= deadline:
-                raise DocketError(
-                    f"store is locked by another write; if no docket command is running, "
-                    f"delete {path}"
-                ) from None
+                raise DocketError("store is locked by another docket write; try again")
             time.sleep(0.02)
-    try:
-        with os.fdopen(fd, "w") as f:
-            f.write(str(os.getpid()))
-        yield
+        try:
+            yield
+        finally:
+            _unlock(fd)
     finally:
-        path.unlink(missing_ok=True)
+        os.close(fd)
 
 
-def _is_stale(path: Path) -> bool:
+def _try_lock(fd: int) -> bool:
     try:
-        return time.time() - path.stat().st_mtime > LOCK_STALE
+        if os.name == "nt":
+            import msvcrt
+
+            msvcrt.locking(fd, msvcrt.LK_NBLCK, 1)
+        else:
+            import fcntl
+
+            fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
     except OSError:
         return False
+    return True
+
+
+def _unlock(fd: int) -> None:
+    # Windows may release a lock some time after its handle closes, so unlock first.
+    if os.name == "nt":
+        import msvcrt
+
+        msvcrt.locking(fd, msvcrt.LK_UNLCK, 1)
 
 
 def atomic_write(path: Path, data: bytes) -> None:
