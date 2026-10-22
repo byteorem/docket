@@ -7,10 +7,10 @@ Each repo keeps its tasks in `.git/docket/` as Markdown files with YAML frontmat
 ## Install
 
 ```sh
-uv tool install .
+uv tool install git+https://github.com/byteorem/docket
 ```
 
-Run it from a clone. Requires Python 3.12+.
+Requires [uv](https://docs.astral.sh/uv/) and Git; uv fetches Python 3.12 if it's missing. To update to the latest `main`, run the same command with `--force`. From a clone, `uv tool install .` installs the working tree instead.
 
 ## Usage
 
