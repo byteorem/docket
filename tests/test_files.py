@@ -14,7 +14,9 @@ def task_file(store: Path, task_id: str) -> Path:
 
 def test_create_writes_the_spec_format(store, mk, ok):
     dep_id = mk("Dependency")
-    task_id = mk("Add CSV export", "--dep", dep_id, "--set", "branch=feat/csv", stdin="Body\n")
+    task_id = mk(
+        "Add CSV export", "--dep", dep_id, "--set", "branch=feat/csv", "--file", "-", stdin="Body\n"
+    )
     raw = task_file(store, task_id).read_bytes()
     assert b"\r\n" not in raw and not raw.startswith(b"\xef\xbb\xbf")
     assert re.fullmatch(
@@ -179,9 +181,9 @@ def test_create_set_without_equals_is_a_usage_error(store, run):
 
 
 def test_note_appends_timestamped_text_under_notes(store, ok, mk):
-    task_id = mk("Task", stdin="Body")
+    task_id = mk("Task", "--file", "-", stdin="Body")
     ok("note", task_id, "First")
-    ok("note", task_id, stdin="From stdin\nsecond line\n")
+    ok("note", task_id, "-", stdin="From stdin\nsecond line\n")
     text = task_file(store, task_id).read_text()
     assert re.fullmatch(
         f"(?s)---\n.*---\n\nBody\n\n## Notes\n\n\\*\\*{TS}\\*\\* First\n\n"
@@ -191,7 +193,7 @@ def test_note_appends_timestamped_text_under_notes(store, ok, mk):
 
 
 def test_note_stays_out_of_the_last_section(store, ok, mk, tmp_path):
-    task_id = mk("Task", stdin="## Plan\n\n- step")
+    task_id = mk("Task", "--file", "-", stdin="## Plan\n\n- step")
     ok("note", task_id, "logged")
     plan = tmp_path / "plan.md"
     plan.write_text("- new step\n", encoding="utf-8")
@@ -202,7 +204,7 @@ def test_note_stays_out_of_the_last_section(store, ok, mk, tmp_path):
 
 
 def test_note_reuses_an_existing_notes_section(store, ok, mk):
-    task_id = mk("Task", stdin="## notes\n\nby hand\n\n## Plan\n\n- step")
+    task_id = mk("Task", "--file", "-", stdin="## notes\n\nby hand\n\n## Plan\n\n- step")
     ok("note", task_id, "logged")
     assert re.fullmatch(
         f"\n## notes\n\nby hand\n\n\\*\\*{TS}\\*\\* logged\n\n## Plan\n\n- step\n",
@@ -210,8 +212,24 @@ def test_note_reuses_an_existing_notes_section(store, ok, mk):
     )
 
 
-def test_note_needs_text(store, fail, mk):
-    assert "empty" in fail("note", mk("Task"), "  ")
+def test_note_needs_text(store, run, fail, mk):
+    task_id = mk("Task")
+    assert "empty" in fail("note", task_id, "  ")
+    result = run("note", task_id, "--json", stdin="piped")
+    assert result.code == 2 and result.stdout == ""
+
+
+def test_stdin_is_read_only_when_asked(store, ok, mk):
+    # An agent's shell can leave stdin an open pipe, so reading it unasked would hang.
+    task_id = mk("Task", stdin="ignored")
+    assert ok("show", task_id)["body"] == ""
+
+
+def test_body_file_that_is_not_utf8_is_a_one_line_error(store, fail, tmp_path):
+    bad = tmp_path / "bad.md"
+    bad.write_bytes(b"caf\xe9\n")
+    assert f"{bad}: not valid UTF-8" in fail("create", "Task", "--file", str(bad))
+    assert not (store / "tasks").exists() or list((store / "tasks").iterdir()) == []
 
 
 def body_of(store: Path, task_id: str) -> str:
@@ -219,9 +237,9 @@ def body_of(store: Path, task_id: str) -> str:
 
 
 def test_body_replaces_appends_and_swaps(store, ok, mk, tmp_path):
-    task_id = mk("Task", stdin="Old body")
+    task_id = mk("Task", "--file", "-", stdin="Old body")
     head = task_file(store, task_id).read_bytes().partition(b"---\n\n")[0]
-    ok("body", task_id, stdin="New body\n\n")
+    ok("body", task_id, "--file", "-", stdin="New body\n\n")
     assert body_of(store, task_id) == "\nNew body\n"
     ok("body", task_id, "--append", "More")
     assert body_of(store, task_id) == "\nNew body\n\nMore\n"
@@ -235,7 +253,7 @@ def test_body_replaces_appends_and_swaps(store, ok, mk, tmp_path):
 
 
 def test_body_replace_needs_exactly_one_match(store, ok, fail, mk):
-    task_id = mk("Task", stdin="a b a")
+    task_id = mk("Task", "--file", "-", stdin="a b a")
     assert "2 times" in fail("body", task_id, "--replace", "a", "c")
     assert "not found" in fail("body", task_id, "--replace", "z", "c")
     ok("body", task_id, "--replace", " b", "")
@@ -260,10 +278,10 @@ note
 
 
 def test_body_sections(store, ok, mk):
-    task_id = mk("Task", stdin=SECTIONED)
+    task_id = mk("Task", "--file", "-", stdin=SECTIONED)
     ok("body", task_id, "--section", "plan", "--append", "- new step")
     ok("body", task_id, "--section", "Detail", "--replace", "deep", "deeper")
-    ok("body", task_id, "--section", "Notes", stdin="replaced")
+    ok("body", task_id, "--section", "Notes", "--file", "-", stdin="replaced")
     assert body_of(store, task_id) == (
         "\nIntro\n\n## Plan\n\n- old step\n\n### Detail\n\ndeeper\n\n- new step\n\n"
         "## Notes\n\nreplaced\n"
@@ -271,20 +289,20 @@ def test_body_sections(store, ok, mk):
 
 
 def test_body_section_name_may_include_the_heading_marks(store, ok, mk):
-    task_id = mk("Task", stdin="## Plan\n\n- step")
+    task_id = mk("Task", "--file", "-", stdin="## Plan\n\n- step")
     ok("body", task_id, "--section", "## Plan", "--append", "- next")
     assert body_of(store, task_id) == "\n## Plan\n\n- step\n\n- next\n"
 
 
 def test_body_adds_a_missing_section_but_replace_needs_it(store, ok, fail, mk):
-    task_id = mk("Task", stdin="Intro")
+    task_id = mk("Task", "--file", "-", stdin="Intro")
     assert "no section 'Plan'" in fail("body", task_id, "--section", "Plan", "--replace", "a", "b")
     ok("body", task_id, "--section", "Plan", "--append", "- step")
     assert body_of(store, task_id) == "\nIntro\n\n## Plan\n\n- step\n"
 
 
 def test_body_section_skips_headings_in_code_fences(store, ok, mk):
-    task_id = mk("Task", stdin="## Plan\n\n````md\n## Notes\n```\n````\n")
+    task_id = mk("Task", "--file", "-", stdin="## Plan\n\n````md\n## Notes\n```\n````\n")
     ok("body", task_id, "--section", "Notes", "--append", "real")
     ok("body", task_id, "--section", "Plan", "--append", "step")
     assert body_of(store, task_id) == (
@@ -293,7 +311,7 @@ def test_body_section_skips_headings_in_code_fences(store, ok, mk):
 
 
 def test_body_rejects_duplicate_sections(store, fail, mk):
-    task_id = mk("Task", stdin="## Plan\n\na\n\n## plan ##\n\nb")
+    task_id = mk("Task", "--file", "-", stdin="## Plan\n\na\n\n## plan ##\n\nb")
     message = fail("body", task_id, "--section", "Plan", "--append", "x")
     assert "appears 2 times (lines 8, 12)" in message
 
@@ -307,7 +325,7 @@ def test_body_keeps_crlf_line_endings(store, ok, mk):
 
 
 def test_show_section_prints_only_that_section(store, ok, run, fail, mk):
-    task_id = mk("Task", stdin=SECTIONED)
+    task_id = mk("Task", "--file", "-", stdin=SECTIONED)
     assert ok("show", task_id, "--section", "## plan") == {
         "id": task_id,
         "section": "plan",
@@ -321,7 +339,7 @@ def test_show_section_prints_only_that_section(store, ok, run, fail, mk):
     "args", [("show",), ("show", "--section", "Plan"), ("body", "--append", "x")]
 )
 def test_body_that_is_not_utf8_is_a_one_line_error(store, fail, mk, args):
-    task_id = mk("Task", stdin="## Plan\n\nstep")
+    task_id = mk("Task", "--file", "-", stdin="## Plan\n\nstep")
     path = task_file(store, task_id)
     path.write_bytes(path.read_bytes() + b"caf\xe9\n")
     before = path.read_bytes()
@@ -329,17 +347,18 @@ def test_body_that_is_not_utf8_is_a_one_line_error(store, fail, mk, args):
     assert path.read_bytes() == before
 
 
-def test_body_rejects_empty_text_and_mixed_modes(store, run, fail, mk):
-    task_id = mk("Task", stdin="Body")
-    assert "empty" in fail("body", task_id)
+def test_body_rejects_empty_text_and_needs_one_mode(store, run, fail, mk):
+    task_id = mk("Task", "--file", "-", stdin="Body")
+    assert "empty" in fail("body", task_id, "--file", "-", stdin="\n")
     assert "empty" in fail("body", task_id, "--replace", "", "x")
-    result = run("body", task_id, "--append", "x", "--replace", "a", "b", "--json")
-    assert result.code == 2 and result.stdout == ""
+    for args in [(), ("--append", "x", "--replace", "a", "b")]:
+        result = run("body", task_id, *args, "--json")
+        assert result.code == 2 and result.stdout == ""
 
 
 def test_show_text_prints_the_file_then_sections(store, run, mk):
     parent = mk("Parent")
-    child = mk("Child", "--parent", parent, stdin="Child body")
+    child = mk("Child", "--parent", parent, "--file", "-", stdin="Child body")
     result = run("show", child)
     assert result.code == 0
     file_text = task_file(store, child).read_text()

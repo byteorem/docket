@@ -71,7 +71,7 @@ def cmd_create(args: argparse.Namespace) -> None:
         parent=args.parent,
         deps=args.dep,
         fields=args.set,
-        body=_read_text(args.file) if args.file else _read_stdin(),
+        body=_read_text(args.file) if args.file else "",
     )
     _written("created", task, args.json)
 
@@ -193,7 +193,7 @@ def cmd_undep(args: argparse.Namespace) -> None:
 def cmd_note(args: argparse.Namespace) -> None:
     from docket import tasks
 
-    text = args.text if args.text is not None else _read_stdin()
+    text = _read_text("-") if args.text == "-" else args.text
     _written("noted", tasks.note(args.id, text), args.json)
 
 
@@ -206,7 +206,7 @@ def cmd_body(args: argparse.Namespace) -> None:
     elif args.replace is not None:
         mode, (old, text) = "replace", args.replace
     else:
-        mode, text = "set", _read_text(args.file) if args.file else _read_stdin()
+        mode, text = "set", _read_text(args.file)
     task = tasks.edit_body(args.id, mode, text, old=old, section=args.section)
     _written("updated", task, args.json)
 
@@ -312,15 +312,17 @@ def _count(text: str) -> int:
 
 
 def _read_text(path: str) -> str:
+    """The text in PATH, or stdin when PATH is -. Stdin is never read unasked."""
     from pathlib import Path
 
-    return Path(path).read_text(encoding="utf-8-sig")
+    from docket.store import DocketError
 
-
-def _read_stdin() -> str:
-    if sys.stdin is None or sys.stdin.isatty():
-        return ""
-    return sys.stdin.read()
+    try:
+        if path == "-":
+            return sys.stdin.read()
+        return Path(path).read_text(encoding="utf-8-sig")
+    except UnicodeDecodeError:
+        raise DocketError(f"{'stdin' if path == '-' else path}: not valid UTF-8") from None
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -349,14 +351,14 @@ def build_parser() -> argparse.ArgumentParser:
             help="only tasks whose field K is V or a list containing V (repeatable)",
         )
 
-    p = command("create", cmd_create, "Create a task; body from stdin or --file. Prints the ID.")
+    p = command("create", cmd_create, "Create a task, with a body from --file. Prints the ID.")
     p.add_argument("title")
     p.add_argument("--parent", metavar="ID", help="create a subtask of ID")
     p.add_argument("--dep", metavar="ID", action="append", default=[], help="repeatable")
     p.add_argument(
         "--set", metavar="K=V", type=_pair, action="append", default=[], help="repeatable"
     )
-    p.add_argument("--file", metavar="PATH", help="read the body from PATH")
+    p.add_argument("--file", metavar="PATH", help="read the body from PATH, or stdin for -")
 
     p = command("show", cmd_show, "Print the task file, then parent, blockers, and subtasks.")
     p.add_argument("id")
@@ -415,15 +417,17 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("id")
     p.add_argument("dep_id")
 
-    p = command("note", cmd_note, "Append a timestamped note to the body; text from stdin.")
+    p = command("note", cmd_note, "Append a timestamped note under ## Notes.")
     p.add_argument("id")
-    p.add_argument("text", nargs="?")
+    p.add_argument("text", help="the note, or - to read it from stdin")
 
     p = command("body", cmd_body, "Replace the body, append to it, or swap one exact match.")
     p.add_argument("id")
     p.add_argument("--section", metavar="NAME", help="work inside the section under heading NAME")
-    edit = p.add_mutually_exclusive_group()
-    edit.add_argument("--file", metavar="PATH", help="replace with the text in PATH, not stdin")
+    edit = p.add_mutually_exclusive_group(required=True)
+    edit.add_argument(
+        "--file", metavar="PATH", help="replace with the text in PATH, or stdin for -"
+    )
     edit.add_argument("--append", metavar="TEXT", help="add TEXT at the end")
     edit.add_argument(
         "--replace", nargs=2, metavar=("OLD", "NEW"), help="swap the one exact match of OLD"
