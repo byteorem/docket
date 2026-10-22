@@ -30,11 +30,13 @@ def test_top_level_ids_are_four_lowercase_characters(store, mk):
 def test_prefix_resolution(store, ok, fail):
     write_task(store, "a3f8")
     write_task(store, "a3f8.1")
+    write_task(store, "a3f8.1.1")
     write_task(store, "a3k2")
     assert ok("show", "a3f8")["id"] == "a3f8"
     assert ok("show", "a3k")["id"] == "a3k2"
+    assert ok("show", "a3f")["id"] == "a3f8"
     assert ok("show", "a3f8.")["id"] == "a3f8.1"
-    assert "ambiguous ID 'a3': a3f8, a3f8.1, a3k2" in fail("show", "a3")
+    assert "ambiguous ID 'a3': a3f8, a3f8.1, a3f8.1.1, a3k2" in fail("show", "a3")
     assert "no task 'zz'" in fail("show", "zz")
 
 

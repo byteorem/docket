@@ -239,16 +239,17 @@ class Snapshot:
 
 
 def _match(ref: str, ids: Iterable[str], missing: str) -> str:
-    """Exact ID, else the one ID starting with REF."""
+    """Exact ID, else the one ID starting with REF that the other matches are subtasks of."""
     ids = list(ids)
     if ref in ids:
         return ref
     found = sorted((i for i in ids if i.startswith(ref)), key=id_key)
     if not found:
         raise DocketError(missing)
-    if len(found) > 1:
+    top = min(found, key=len)
+    if any(i != top and not i.startswith(top + ".") for i in found):
         raise DocketError(f"ambiguous ID '{ref}': {', '.join(found)}")
-    return found[0]
+    return top
 
 
 def snapshot(location: Location | None = None) -> Snapshot:
